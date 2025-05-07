@@ -2,17 +2,16 @@
 
 ## SETUP
 
-- Minecraft version: TODO
+- Minecraft version: 1.21.1
 - Minecraft server: PaperMC
+
+Run [`setup.sh`](setup.sh).
 
 ## Data Collection
 
-- [AmuletCore](https://github.com/Amulet-Team/Amulet-Core) can be used to extract `.mca` region files.
+- Tool for extracting `.mca` files: [AmuletCore](https://github.com/Amulet-Team/Amulet-Core) can be used to extract `.mca` region files.
 - Server download: [PaperMC](https://api.papermc.io/v2/projects/paper/versions/1.21.1/builds/133/downloads/paper-1.21.1-133.jar)
+- Plugin for generation: [Chunky](https://hangarcdn.papermc.io/plugins/pop4959/Chunky/versions/1.4.36/PAPER/Chunky-Bukkit-1.4.36.jar)
 
-```bash
-mkdir paper-server && cd paper-server
-wget https://api.papermc.io/v2/projects/paper/versions/1.21.1/builds/133/downloads/paper-1.21.1-133.jar
-mv paper-1.21.1-133.jar paper.jar
-chmod +x start.sh
-```
+Run [`start.sh`](start.sh). Configure your memory properly.
+After the console appears, type in command `chunk radius 256c` to set the generation area, and `chunk start` to start generation.

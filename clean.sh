@@ -1,0 +1,21 @@
+#!/bin/bash
+rm -rf cache/
+rm -rf libraries/
+rm -rf logs/
+rm -rf plugins/
+rm -rf versions/
+rm -rf world/
+rm -rf world_nether/
+rm -rf world_the_end/
+rm -rf .console_history
+rm -rf banned-ips.json
+rm -rf banned-players.json
+rm -rf bukkit.yml
+rm -rf commands.yml
+rm -rf help.yml
+rm -rf ops.json
+rm -rf permissions.yml
+rm -rf spigot.yml
+rm -rf usercache.json
+rm -rf version_history.json
+rm -rf whitelist.json
