@@ -16,3 +16,9 @@ Run [`setup.sh`](setup.sh).
 
 Run [`start.sh`](start.sh). Configure your memory properly.
 After the console appears, type in command `chunky radius 256c` to set the generation area, and `chunky start` to start generation.
+
+## TODO
+1. A python script to launch multiple worlds at the same time for data generation.
+2. A python script to read in the `.mca` file and print out the json formatted training data.
+   - In presentation, remove the particular selected region.
+   - Put in the regenerated version through json file.

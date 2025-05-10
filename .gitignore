@@ -9,12 +9,10 @@ world_the_end/
 .console_history
 banned-ips.json
 banned-players.json
-bukkit.yml
 commands.yml
 help.yml
 ops.json
 permissions.yml
-spigot.yml
 usercache.json
 version_history.json
 whitelist.json

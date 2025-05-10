@@ -28,8 +28,8 @@ chunk-loading-basic:
   player-max-chunk-send-rate: 75.0
 chunk-system:
   gen-parallelism: default
-  io-threads: -1
-  worker-threads: -1
+  io-threads: 16
+  worker-threads: 128
 collisions:
   enable-player-collisions: true
   send-full-pos-for-hard-colliding-entities: true
@@ -72,7 +72,7 @@ misc:
   fix-entity-position-desync: true
   load-permissions-yml-before-plugins: true
   max-joins-per-tick: 5
-  region-file-cache-size: 256
+  region-file-cache-size: 8
   strict-advancement-dimension-check: false
   use-alternative-luck-formula: false
   use-dimension-type-for-custom-spawners: false
