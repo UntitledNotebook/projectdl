@@ -37,7 +37,7 @@ def collect_chunk_metadata_and_snbt(world_obj, cx, cz):
         temp_surface_y = min_y_dim - 1
         for y_coord in range(max_y_dim - 1, min_y_dim - 1, -1):
             block = chunk.get_block(8, y_coord, 8)
-            if block.base_name == "water" or "cave_air":
+            if block.base_name == "water":
                 return cx, cz, Counter(), -1 # Return empty Counter
             elif block.base_name != "air":
                 temp_surface_y = y_coord
