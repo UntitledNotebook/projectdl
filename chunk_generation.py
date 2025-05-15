@@ -21,7 +21,6 @@ parser = argparse.ArgumentParser(description="Generate a Minecraft world with a 
 parser.add_argument("--memory", default="6G", help="Memory for the server, e.g., 6G, 10G (default: 6G)")
 parser.add_argument("--port", type=int, default=25565, help="Port for the server (default: 25565)")
 parser.add_argument("--chunk-radius", type=int, required=True, help="Radius in chunks for world generation (e.g., 16 for a 256 block radius from center 0,0).")
-parser.add_argument("--folder", type=str, default=f"server_{datetime.now().strftime('%Y%m%d_%H%M%S')}", help="Folder name for the server directory (default: server_<timestamp>)")
 args = parser.parse_args()
 
 # Server configuration
@@ -35,7 +34,7 @@ SERVER_PROPERTIES_TEMPLATE = BASE_DIR / "server.properties"
 
 # Generate timestamp-based server directories
 TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
-SERVER_DIR = Path(args.folder)
+SERVER_DIR = Path(f"worlds/server_{TIMESTAMP}")
 
 # Aikar’s JVM flags with GC logging
 AIKAR_FLAGS = [
@@ -112,8 +111,6 @@ def setup_server_directory(server_dir: Path, seed: int, port: int):
                     f.write(f"level-seed={seed}\n")
                 elif line.startswith("server-port="):
                     f.write(f"server-port={port}\n")
-                elif line.startswith("level-type=") and args.folder in ["forest", "plains", "desert"]:
-                    f.write(f"level-type=minecraft\\:single_biome_surface\n")
                 else:
                     f.write(line)
     else:
@@ -256,7 +253,7 @@ def main():
 
     
     logging.info(f"Starting world generation in {SERVER_DIR}, using port {SERVER_PORT}")
-    logging.info(f"Targeting radius {chunky_radius_blocks} blocks (from {args.chunk_radius} chunks).")
+    logging.info(f"Targeting radius {chunky_radius_blocks} blocks.")
     
     try:
         run_server(SERVER_DIR, seed, chunky_radius_blocks, SERVER_PORT)
