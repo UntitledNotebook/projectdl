@@ -136,7 +136,9 @@ class DDPM(nn.Module):
         # 采样：逆扩散过程
         for i in range(self.n_T, 0, -1):
             z = torch.randn(n_sample, *size).to(device) if i > 1 else 0
-            eps = self.eps_model(x_i, i / self.n_T)
+            t_tensor = torch.full((n_sample,), i / self.n_T, device=device, dtype=torch.float32)
+            
+            eps = self.eps_model(x_i, t_tensor)
             x_i = (
                 self.oneover_sqrta[i] * (x_i - eps * self.mab_over_sqrtmab[i])
                 + self.sqrt_beta_t[i] * z
