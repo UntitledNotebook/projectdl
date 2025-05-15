@@ -14,7 +14,7 @@ from collections import Counter # Add this import
 # Initialize the argument parser instance.
 arg_parser = argparse.ArgumentParser(description="Process Minecraft world data to extract 16x16x16 block ID samples near the surface.")
 arg_parser.add_argument("--folder", type=str, required=True, help="Minecraft server folder name under worlds/")
-arg_parser.add_argument("--chunk-radius", type=int, default=5, help="Chunk radius around world center (0,0) to process (default: 5)")
+arg_parser.add_argument("--chunk-radius", type=int, default=64, help="Chunk radius around world center (0,0) to process (default: 5)")
 arg_parser.add_argument("--num-workers", type=int, default=os.cpu_count() or 4, help=f"Number of worker threads (default: {os.cpu_count() or 4})")
 args = arg_parser.parse_args()
 
@@ -27,7 +27,7 @@ def collect_chunk_metadata_and_snbt(world_obj, cx, cz):
     and their counts from the 16x16x16 region at that surface.
     Returns (cx, cz, Counter_of_snbt_strings, base_y).
     """
-    min_y_dim, max_y_dim = 0, 128
+    min_y_dim, max_y_dim = 0, 256
     local_snbt_counts = Counter() # Changed from set to Counter
     base_y = min_y_dim - 1 # Initialize base_y for early exit/error cases
 
@@ -36,8 +36,8 @@ def collect_chunk_metadata_and_snbt(world_obj, cx, cz):
         
         temp_surface_y = min_y_dim - 1
         for y_coord in range(max_y_dim - 1, min_y_dim - 1, -1):
-            block = chunk.get_block(8, y_coord, 8) 
-            if block.base_name == "water" or "cave_air": 
+            block = chunk.get_block(8, y_coord, 8)
+            if block.base_name == "water" or "cave_air":
                 return cx, cz, Counter(), -1 # Return empty Counter
             elif block.base_name != "air":
                 temp_surface_y = y_coord
@@ -47,7 +47,7 @@ def collect_chunk_metadata_and_snbt(world_obj, cx, cz):
             logging.debug(f"No valid surface point found for chunk ({cx},{cz}).")
             return cx, cz, Counter(), -1 # Return empty Counter
 
-        base_y = temp_surface_y - random.randint(4, 12)
+        base_y = temp_surface_y - random.randint(6, 10)
 
         for dx_in_chunk in range(16):
             for dz_in_chunk in range(16):

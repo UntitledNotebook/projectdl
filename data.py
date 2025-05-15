@@ -23,7 +23,6 @@ for subfolder in Path("data").iterdir():
                 for key, value in counts_data.items():
                     combined_counts[key] = combined_counts.get(key, 0) + value
 
-
 air_snbt_str = amulet.Block("universal_minecraft", "air").snbt_blockstate
 combined_palette.discard(air_snbt_str)
 sorted_other_snbt = sorted(list(combined_palette))
@@ -36,12 +35,12 @@ dataset = []
 for subfolder in Path("data").iterdir():
     if subfolder.is_dir():
         npy_file = subfolder / "processed_block_ids.npy"
-        sorted_other_snbt = {}
+        subfolder_snbt_palette_map = {}
         with open(subfolder / "snbt_palette_map.json", 'r') as f:
-            sorted_other_snbt = json.load(f)
+            subfolder_snbt_palette_map = json.load(f)
         if npy_file.exists():
             block_id_array = np.load(npy_file)
-            id_remap = {i: snbt_to_id_map.get(snbt, 0) for i, snbt in enumerate(sorted_other_snbt)}
+            id_remap = {int(i): snbt_to_id_map.get(snbt, 0) for i, snbt in subfolder_snbt_palette_map.items()}
             remapped_array = np.vectorize(lambda x: id_remap.get(x, 0))(block_id_array)
             dataset.append(remapped_array)
 
