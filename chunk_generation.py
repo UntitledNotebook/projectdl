@@ -116,14 +116,6 @@ def setup_server_directory(server_dir: Path, seed: int, port: int):
     else:
         logging.warning(f"server.properties template not found at {SERVER_PROPERTIES_TEMPLATE}. Using default server generation.")
 
-    # Copy spigot.yml and bukkit.yml if they exist
-    for config_file_name in ["spigot.yml", "bukkit.yml"]:
-        src_config_path = BASE_DIR / config_file_name
-        if src_config_path.exists():
-            shutil.copy(src_config_path, server_dir / config_file_name)
-        else:
-            logging.info(f"{config_file_name} not found at {src_config_path}, skipping copy.")
-
     plugins_dir = server_dir / "plugins"
     plugins_dir.mkdir(exist_ok=True)
     chunky_jar_dest = plugins_dir / CHUNKY_JAR # Note: Chunky JAR name includes version
