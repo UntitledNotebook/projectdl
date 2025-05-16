@@ -1,4 +1,6 @@
 worlds/
 data/
+output/
 Chunky-Bukkit-1.4.36.jar
 server.jar
+wandb/

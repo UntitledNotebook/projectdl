@@ -32,7 +32,7 @@ def collect_chunk_metadata_and_snbt(world_obj, cx, cz):
     and their counts from the 16x16x16 region at that surface.
     Returns (cx, cz, Counter_of_snbt_strings, base_y).
     """
-    min_y_dim, max_y_dim = 0, 256
+    min_y_dim, max_y_dim = 32, 256
     local_snbt_counts = Counter() # Changed from set to Counter
     base_y = min_y_dim - 1 # Initialize base_y for early exit/error cases
     surface_ys = []
@@ -40,9 +40,6 @@ def collect_chunk_metadata_and_snbt(world_obj, cx, cz):
     try:
         for dcx in range(cx, cx + REGION_CHUNK_RADIUS):
             for dcz in range(cz, cz + REGION_CHUNK_RADIUS):
-                # Check if the chunk is within the specified region
-                if abs(dcx) > REGION_CHUNK_RADIUS or abs(dcz) > REGION_CHUNK_RADIUS:
-                    continue
                 chunk = world_obj.get_chunk(dcx, dcz, "minecraft:overworld")
                 for y_coord in range(max_y_dim - 1, min_y_dim - 1, -1):
                     block = chunk.get_block(8, y_coord, 8)
@@ -51,10 +48,11 @@ def collect_chunk_metadata_and_snbt(world_obj, cx, cz):
                     elif block.base_name != "air":
                         surface_ys.append(y_coord)
                         break
+        if not surface_ys or min_y_dim in surface_ys:
+            return cx, cz, Counter(), -1
         mean_ys = sum(surface_ys) / len(surface_ys)
         std_ys = math.sqrt(sum((y - mean_ys) ** 2 for y in surface_ys) / len(surface_ys))
         if std_ys > 10:
-            logging.warning(f"Surface Y levels for chunk ({cx},{cz}) are too variable: {std_ys:.2f} > 10. Skipping.")
             return cx, cz, Counter(), -1
         base_y = int(mean_ys + random.uniform(-std_ys / 2, std_ys / 2) - random.uniform(0.3, 0.7) * REGION_HEIGHT)
 
@@ -178,6 +176,15 @@ def main():
     logging.info(f"Phase 2 completed. Successfully generated {len(all_block_id_arrays)} block ID arrays.")
     world.close()
     logging.info("Minecraft world closed.")
+
+    meta_data = {
+        "region_chunk_radius": REGION_CHUNK_RADIUS,
+        "region_height": REGION_HEIGHT,
+        "chunk_radius": args.chunk_radius,
+        "dataset_length": len(all_block_id_arrays),
+    }
+    with open(OUTPUT_DIR / "meta.json", 'w') as f:
+        json.dump(meta_data, f, indent=2, sort_keys=True)
 
     if all_block_id_arrays:
         try:

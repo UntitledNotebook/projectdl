@@ -3,6 +3,7 @@ import json
 import numpy as np
 from pathlib import Path
 import amulet
+from collections import defaultdict
 
 combined_counts = {}
 
@@ -18,9 +19,9 @@ for subfolder in Path("data").iterdir():
 with open(Path("data") / "snbt_counts.json", 'w') as f:
     json.dump(combined_counts, f, indent=2, sort_keys=True)
 
-THRESHOLD = input("Enter the threshold for combined counts: ")
+THRESHOLD = int(input("Enter the threshold for combined counts: "))
 
-combined_counts = {int(k): v for k, v in combined_counts.items() if v > THRESHOLD}
+combined_counts = {k: v for k, v in combined_counts.items() if v > THRESHOLD}
 air_snbt_str = amulet.Block("universal_minecraft", "air").snbt_blockstate
 combined_palette = set(combined_counts.keys())
 combined_palette.discard(air_snbt_str)
@@ -29,22 +30,58 @@ snbt_to_id = {air_snbt_str: 0}
 snbt_to_id.update({snbt: i + 1 for i, snbt in enumerate(sorted_other_snbt)})
 id_to_snbt = {i: snbt for snbt, i in snbt_to_id.items()}
 
-dataset = []
+dataset = defaultdict(list)
 
-for subfolder in Path("data").iterdir():
-    if subfolder.is_dir():
-        npy_file = subfolder / "block_ids.npy"
-        subfolder_id_to_snbt = {}
-        with open(subfolder / "id_to_snbt.json", 'r') as f:
-            subfolder_snbt_palette_map = json.load(f)
-        if npy_file.exists():
-            block_id_array = np.load(npy_file)
-            id_remap = {int(i): snbt_to_id.get(snbt, 0) for i, snbt in subfolder_snbt_palette_map.items()}
-            remapped_array = np.vectorize(lambda x: id_remap.get(x, 0))(block_id_array)
-            dataset.append(remapped_array)
+import multiprocessing
 
-with open(Path("data") / "id_to_snbt.json", 'w') as f:
-    json.dump(id_to_snbt, f, indent=2, sort_keys=True)
-with open(Path("data") / "snbt_counts.json", 'w') as f:
-    json.dump(combined_counts, f, indent=2, sort_keys=True)
-np.save(Path("data") / "block_ids.npy", np.concatenate(dataset, axis=0))
+def process_subfolder(subfolder_path):
+    npy_file = subfolder_path / "block_ids.npy"
+    metadata_file = subfolder_path / "meta.json"
+    id_to_snbt_file = subfolder_path / "id_to_snbt.json"
+    
+    if not (npy_file.exists() and metadata_file.exists() and id_to_snbt_file.exists()):
+        return None
+
+    with open(id_to_snbt_file, 'r') as f:
+        subfolder_id_to_snbt = json.load(f)
+    
+    with open(metadata_file, 'r') as f:
+        metadata = json.load(f)
+        length = metadata.get("region_chunk_radius", 0) * 16
+        height = metadata.get("region_height", 0)
+    
+    block_id_array = np.load(npy_file)
+    id_remap = {int(i): snbt_to_id.get(snbt, 0) for i, snbt in subfolder_id_to_snbt.items()}
+    remapped_array = np.vectorize(lambda x: id_remap.get(x, 0), otypes=[np.int32])(block_id_array)
+    
+    return (length, height), remapped_array
+
+if __name__ == '__main__':
+    subfolders = [subfolder for subfolder in Path("data").iterdir() if subfolder.is_dir()]
+
+    with multiprocessing.Pool(processes=6) as pool:
+        results = pool.map(process_subfolder, subfolders)
+
+    for result in results:
+        if result:
+            (length, height), remapped_array = result
+            dataset[(length, height)].append(remapped_array)
+
+    with open(Path("data") / "id_to_snbt.json", 'w') as f:
+        json.dump(id_to_snbt, f, indent=2, sort_keys=True)
+    with open(Path("data") / "snbt_counts.json", 'w') as f:
+        json.dump(combined_counts, f, indent=2, sort_keys=True)
+
+    dataset_info = {}
+
+    for (length, height), array_list in dataset.items():
+        combined_array = np.concatenate(array_list, axis=0)
+        np.save(Path("data") / f"block_ids_{length}_{height}.npy", combined_array)
+        dataset_info[str((length, height, length))] = {
+            "shape": combined_array.shape,
+            "dtype": str(combined_array.dtype),
+            "size": combined_array.nbytes
+        }
+
+    with open(Path("data") / "dataset_info.json", 'w') as f:
+        json.dump(dataset_info, f, indent=2, sort_keys=True)
