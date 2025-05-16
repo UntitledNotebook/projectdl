@@ -9,17 +9,22 @@ from tqdm import tqdm
 import random
 from pathlib import Path
 from collections import Counter # Add this import
+import math
 
 # Add counts to each block
 # Initialize the argument parser instance.
 arg_parser = argparse.ArgumentParser(description="Process Minecraft world data to extract 16x16x16 block ID samples near the surface.")
 arg_parser.add_argument("--folder", type=str, required=True, help="Minecraft server folder name under worlds/")
 arg_parser.add_argument("--chunk-radius", type=int, default=64, help="Chunk radius around world center (0,0) to process (default: 5)")
+arg_parser.add_argument("--region-chunk-radius", type=int, default=1, help="Side length of each region in chunks (default: 1)")
+arg_parser.add_argument("--region-height", type=int, default=16, help="Height of each region (default: 16)")
 arg_parser.add_argument("--num-workers", type=int, default=os.cpu_count() or 4, help=f"Number of worker threads (default: {os.cpu_count() or 4})")
 args = arg_parser.parse_args()
 
 SERVER_DIR = Path(f"worlds/{args.folder}")
 OUTPUT_DIR = Path(f"data/{args.folder}")
+REGION_CHUNK_RADIUS = args.region_chunk_radius
+REGION_HEIGHT = args.region_height
 
 def collect_chunk_metadata_and_snbt(world_obj, cx, cz):
     """
@@ -30,61 +35,66 @@ def collect_chunk_metadata_and_snbt(world_obj, cx, cz):
     min_y_dim, max_y_dim = 0, 256
     local_snbt_counts = Counter() # Changed from set to Counter
     base_y = min_y_dim - 1 # Initialize base_y for early exit/error cases
+    surface_ys = []
 
     try:
-        chunk = world_obj.get_chunk(cx, cz, "minecraft:overworld")
-        
-        temp_surface_y = min_y_dim - 1
-        for y_coord in range(max_y_dim - 1, min_y_dim - 1, -1):
-            block = chunk.get_block(8, y_coord, 8)
-            if block.base_name == "water":
-                return cx, cz, Counter(), -1 # Return empty Counter
-            elif block.base_name != "air":
-                temp_surface_y = y_coord
-                break
-        
-        if temp_surface_y < min_y_dim: 
-            logging.debug(f"No valid surface point found for chunk ({cx},{cz}).")
-            return cx, cz, Counter(), -1 # Return empty Counter
+        for dcx in range(cx, cx + REGION_CHUNK_RADIUS):
+            for dcz in range(cz, cz + REGION_CHUNK_RADIUS):
+                # Check if the chunk is within the specified region
+                if abs(dcx) > REGION_CHUNK_RADIUS or abs(dcz) > REGION_CHUNK_RADIUS:
+                    continue
+                chunk = world_obj.get_chunk(dcx, dcz, "minecraft:overworld")
+                for y_coord in range(max_y_dim - 1, min_y_dim - 1, -1):
+                    block = chunk.get_block(8, y_coord, 8)
+                    if block.base_name == "water":
+                        return cx, cz, Counter(), -1
+                    elif block.base_name != "air":
+                        surface_ys.append(y_coord)
+                        break
+        mean_ys = sum(surface_ys) / len(surface_ys)
+        std_ys = math.sqrt(sum((y - mean_ys) ** 2 for y in surface_ys) / len(surface_ys))
+        if std_ys > 10:
+            logging.warning(f"Surface Y levels for chunk ({cx},{cz}) are too variable: {std_ys:.2f} > 10. Skipping.")
+            return cx, cz, Counter(), -1
+        base_y = int(mean_ys + random.uniform(-std_ys / 2, std_ys / 2) - random.uniform(0.3, 0.7) * REGION_HEIGHT)
 
-        base_y = temp_surface_y - random.randint(6, 10)
-
-        for dx_in_chunk in range(16):
-            for dz_in_chunk in range(16):
-                for dy_offset in range(16): 
-                    world_y = base_y + dy_offset
-                    if not (min_y_dim <= world_y < max_y_dim):
-                        continue 
-                    
-                    block_in_region = chunk.get_block(dx_in_chunk, world_y, dz_in_chunk)
-                    local_snbt_counts[block_in_region.snbt_blockstate] += 1 # Increment count
+        for dcx in range(cx, cx + REGION_CHUNK_RADIUS):
+            for dcz in range(cz, cz + REGION_CHUNK_RADIUS):
+                chunk = world_obj.get_chunk(dcx, dcz, "minecraft:overworld")
+                for dx_in_chunk in range(16):
+                    for dz_in_chunk in range(16):
+                        for dy_offset in range(REGION_HEIGHT):
+                            current_world_y = base_y + dy_offset
+                            block = chunk.get_block(dx_in_chunk, current_world_y, dz_in_chunk)
+                            snbt_string = block.snbt_blockstate
+                            local_snbt_counts[snbt_string] += 1
                     
     except amulet.api.errors.ChunkDoesNotExist:
         logging.warning(f"Chunk ({cx},{cz}) does not exist.")
-        # base_y remains sentinel, local_snbt_counts remains empty or as is before error
     except Exception as e:
         logging.error(f"Error in collect_chunk_metadata_and_snbt for chunk ({cx},{cz}): {e}", exc_info=True)
-        # base_y remains sentinel, local_snbt_counts remains empty or as is before error
 
-    return cx, cz, local_snbt_counts, base_y # Return Counter
+    return cx, cz, local_snbt_counts, base_y
 
 def extract_block_id_array(world_obj, cx, cz, base_y, 
-                           snbt_to_id_map, air_snbt_id):
-    """
-    Extracts a 16x16x16 region of block IDs from a chunk based on SNBT strings.
-    Returns only the NumPy array.
-    """
-    block_id_array = np.full((16, 16, 16), air_snbt_id, dtype=np.uint32)
-    
+                           snbt_to_id, air_snbt_id):
+    block_id_array = np.full((16 * REGION_CHUNK_RADIUS,
+                              REGION_HEIGHT,
+                              16 * REGION_CHUNK_RADIUS), air_snbt_id, dtype=np.uint64)
+
     try:
         chunk = world_obj.get_chunk(cx, cz, "minecraft:overworld")
-        for dx_in_chunk in range(16):
-            for dz_in_chunk in range(16):
-                for dy_offset in range(16):
-                    current_world_y = base_y + dy_offset
-                    block = chunk.get_block(dx_in_chunk, current_world_y, dz_in_chunk)
-                    snbt_string = block.snbt_blockstate
-                    block_id_array[dx_in_chunk, dy_offset, dz_in_chunk] = snbt_to_id_map.get(snbt_string, air_snbt_id)
+        for dcx in range(cx, cx + REGION_CHUNK_RADIUS):
+            for dcz in range(cz, cz + REGION_CHUNK_RADIUS):
+                for dx_in_chunk in range(16):
+                    for dz_in_chunk in range(16):
+                        for dy_offset in range(REGION_HEIGHT):
+                            current_world_y = base_y + dy_offset
+                            block = chunk.get_block(dx_in_chunk, current_world_y, dz_in_chunk)
+                            snbt_string = block.snbt_blockstate
+                            block_id_array[dx_in_chunk + (dcx - cx) * 16,
+                                           dy_offset,
+                                           dz_in_chunk + (dcz - cz) * 16] = snbt_to_id.get(snbt_string, air_snbt_id)
     
     except amulet.api.errors.ChunkDoesNotExist:
         logging.warning(f"Chunk ({cx},{cz}) vanished before ID array extraction. Resulting array is air-filled.")
@@ -105,11 +115,10 @@ def main():
         return
     
     logging.info(f"Processing Overworld chunks around (0,0) with radius {args.chunk_radius}.")
-
-    target_chunks_coords = [(cx, cz) for cx in range(-args.chunk_radius, args.chunk_radius + 1)
-                            for cz in range(-args.chunk_radius, args.chunk_radius + 1)]
-    all_snbt_counts = Counter() # Changed from set to Counter
-    chunk_processing_params = [] 
+    target_chunks_coords = [(cx, cz) for cx in range(-args.chunk_radius, args.chunk_radius - REGION_CHUNK_RADIUS)
+                            for cz in range(-args.chunk_radius, args.chunk_radius - REGION_CHUNK_RADIUS)]
+    all_snbt_counts = Counter()
+    chunk_processing_params = []
     logging.info("Phase 1: Collecting SNBT palette and surface Y for specified regions...")
     with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
         futures = [executor.submit(collect_chunk_metadata_and_snbt, world, cx, cz)
@@ -137,21 +146,18 @@ def main():
     logging.info(f"Saved SNBT counts to {snbt_counts_path}")
 
     air_snbt_str = amulet.Block("universal_minecraft", "air").snbt_blockstate
-    
-    # Create a mutable copy for palette generation if needed, or work with keys
-    # For snbt_to_id_map, we need unique SNBTs excluding air, sorted.
     unique_snbt_for_palette = set(all_snbt_counts.keys())
     unique_snbt_for_palette.discard(air_snbt_str) 
     sorted_other_snbt = sorted(list(unique_snbt_for_palette))
     
-    snbt_to_id_map = {air_snbt_str: 0}
-    snbt_to_id_map.update({snbt: i + 1 for i, snbt in enumerate(sorted_other_snbt)})
+    snbt_to_id = {air_snbt_str: 0}
+    snbt_to_id.update({snbt: i + 1 for i, snbt in enumerate(sorted_other_snbt)})
     air_snbt_id_val = 0 
 
-    id_to_snbt_map = {i: snbt for snbt, i in snbt_to_id_map.items()}
-    palette_map_path = OUTPUT_DIR / "snbt_palette_map.json" # Corrected path
+    id_to_snbt = {i: snbt for snbt, i in snbt_to_id.items()}
+    palette_map_path = OUTPUT_DIR / "id_to_snbt.json" # Corrected path
     with open(palette_map_path, 'w') as f:
-        json.dump(id_to_snbt_map, f, indent=2, sort_keys=True)
+        json.dump(id_to_snbt, f, indent=2, sort_keys=True)
     logging.info(f"Saved SNBT palette map to {palette_map_path}")
 
     all_block_id_arrays = []
@@ -161,7 +167,7 @@ def main():
         for params in chunk_processing_params:
             cx, cz, base_y = params['cx'], params['cz'], params['base_y']
             futures.append(executor.submit(extract_block_id_array, world, cx, cz,
-                                           base_y, snbt_to_id_map, air_snbt_id_val))
+                                           base_y, snbt_to_id, air_snbt_id_val))
         for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 2"):
             try:
                 block_id_array = future.result()
@@ -176,7 +182,7 @@ def main():
     if all_block_id_arrays:
         try:
             final_npy_array = np.stack(all_block_id_arrays, axis=0)
-            output_npy_path = OUTPUT_DIR / "processed_block_ids.npy" # Corrected path
+            output_npy_path = OUTPUT_DIR / "block_ids.npy"
             np.save(output_npy_path, final_npy_array)
             logging.info(f"Saved {final_npy_array.shape[0]} samples (shape: {final_npy_array.shape}) to {output_npy_path}")
         except Exception as e:
