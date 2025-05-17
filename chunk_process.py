@@ -81,9 +81,9 @@ def extract_block_id_array(world_obj, cx, cz, base_y,
                               16 * REGION_CHUNK_RADIUS), air_snbt_id, dtype=np.uint64)
 
     try:
-        chunk = world_obj.get_chunk(cx, cz, "minecraft:overworld")
         for dcx in range(cx, cx + REGION_CHUNK_RADIUS):
             for dcz in range(cz, cz + REGION_CHUNK_RADIUS):
+                chunk = world_obj.get_chunk(dcx, dcz, "minecraft:overworld")
                 for dx_in_chunk in range(16):
                     for dz_in_chunk in range(16):
                         for dy_offset in range(REGION_HEIGHT):
@@ -113,8 +113,8 @@ def main():
         return
     
     logging.info(f"Processing Overworld chunks around (0,0) with radius {args.chunk_radius}.")
-    target_chunks_coords = [(cx, cz) for cx in range(-args.chunk_radius, args.chunk_radius - REGION_CHUNK_RADIUS)
-                            for cz in range(-args.chunk_radius, args.chunk_radius - REGION_CHUNK_RADIUS)]
+    target_chunks_coords = [(cx, cz) for cx in range(-args.chunk_radius, args.chunk_radius - REGION_CHUNK_RADIUS, REGION_CHUNK_RADIUS)
+                            for cz in range(-args.chunk_radius, args.chunk_radius - REGION_CHUNK_RADIUS, REGION_CHUNK_RADIUS)]
     all_snbt_counts = Counter()
     chunk_processing_params = []
     logging.info("Phase 1: Collecting SNBT palette and surface Y for specified regions...")
