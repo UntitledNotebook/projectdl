@@ -54,7 +54,7 @@ def collect_chunk_metadata_and_snbt(world_obj, cx, cz):
         std_ys = math.sqrt(sum((y - mean_ys) ** 2 for y in surface_ys) / len(surface_ys))
         if std_ys > 10:
             return cx, cz, Counter(), -1
-        base_y = int(mean_ys + random.uniform(-std_ys / 2, std_ys / 2) - random.uniform(0.3, 0.7) * REGION_HEIGHT)
+        base_y = int(mean_ys + random.uniform(-std_ys / 2, std_ys / 2) - random.uniform(0.3, 0.5) * REGION_HEIGHT)
 
         for dcx in range(cx, cx + REGION_CHUNK_RADIUS):
             for dcz in range(cz, cz + REGION_CHUNK_RADIUS):
