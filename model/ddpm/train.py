@@ -11,31 +11,30 @@ import wandb
 from flax import jax_utils
 from typing import Any, Dict, Tuple, Optional
 
-from .model import UNet3D
-from .train_state import TrainState
-from .data import get_dataset
-from .diffusion import p_loss, ddpm_sample_step, get_ddpm_params, sample_loop
-from .utils import l2_loss, l1_loss, create_ema_decay_schedule, apply_ema_decay, copy_params_to_ema, save_checkpoint
+from model import UNet3D
+from train_state import TrainState
+from data import get_dataset
+from diffusion import p_loss, ddpm_sample_step, get_ddpm_params, sample_loop
+from utils import l2_loss, l1_loss, create_ema_decay_schedule, apply_ema_decay, copy_params_to_ema, save_checkpoint
 
 # Global Configurations
 MAX_STEP = 100000
-DATA_PATH = "./minecraft_data.npy"  # Path to .npy file: (n_samples, 32, 32, 32), np.int32
-EMBEDDING_PATH = "./block_embeddings.npy"  # Path to .npy file: (num_blocks, embedding_dim)
+DATA_PATH = "data/block_ids_3000.npy"  # Path to .npy file: (n_samples, 32, 32, 32), np.int32
+EMBEDDING_PATH = "output/block2vec/block_embeddings.npy"  # Path to .npy file: (num_blocks, embedding_dim)
 OUTPUT_DIR = "output/ddpm"  # Base directory for outputs
 CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")  # Subdir for model checkpoints
 SAMPLE_DIR = os.path.join(OUTPUT_DIR, "samples")  # Subdir for generated samples
 SEED = 0
 BATCH_SIZE = 64
 VOXEL_SHAPE = (32, 32, 32)  # (depth, height, width)
-EMBEDDING_DIM = 64  # Matches embedding_dim in EMBEDDING_PATH
+EMBEDDING_DIM = 8  # Matches embedding_dim in EMBEDDING_PATH
 STANDARDIZE_EMBEDDINGS = True  # Whether to standardize embeddings (zero mean, unit variance)
-CACHE_DATA = True
 MODEL_DIM = 64
-DIM_MULTS = (1, 2, 4, 8)
+DIM_MULTS = (1, 2, 4)
 BETA_SCHEDULE = 'cosine'
 TIMESTEPS = 1000
 SELF_CONDITION = False
-PRED_X0 = True
+PRED_X0 = False
 P2_LOSS_WEIGHT_GAMMA = 1.0
 P2_LOSS_WEIGHT_K = 1.0
 HALF_PRECISION = False
@@ -57,6 +56,7 @@ WANDB_LOG_TRAIN = True
 WANDB_PROJECT = 'projectdl'
 WANDB_JOB_TYPE = 'train'
 WANDB_GROUP = 'ddpm'
+WANDB_TAG = ['debug']
 
 def create_model(model_cls, half_precision: bool) -> Any:
     """Creates the UNet3D model with specified precision.
@@ -127,7 +127,6 @@ def train():
                 'voxel_shape': VOXEL_SHAPE,
                 'embedding_dim': EMBEDDING_DIM,
                 'standardize_embeddings': STANDARDIZE_EMBEDDINGS,
-                'cache': CACHE_DATA
             },
             'model': {
                 'dim': MODEL_DIM,
@@ -168,6 +167,7 @@ def train():
             project=WANDB_PROJECT,
             group=WANDB_GROUP,
             job_type=WANDB_JOB_TYPE,
+            tags=WANDB_TAG,
             config=wandb_config
         )
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
@@ -179,6 +179,12 @@ def train():
     state = create_train_state(state_rng)
     from flax.training import checkpoints
     state = checkpoints.restore_checkpoint(CHECKPOINT_DIR, state)
+    if jax.process_index() == 0:
+        unreplicated_params = jax_utils.unreplicate(state.params)
+        param_count = sum(x.size for x in jax.tree_util.tree_leaves(unreplicated_params))
+        logging.info(f"Total number of parameters: {param_count}")
+        if WANDB_LOG_TRAIN:
+            wandb.summary['total_parameters'] = param_count
     step_offset = int(state.step)
     state = jax_utils.replicate(state)
     loss_fn = l2_loss if LOSS_TYPE == 'l2' else l1_loss

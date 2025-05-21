@@ -222,14 +222,14 @@ class Attention3D(nn.Module):
             features=dim * 3, kernel_size=(1, 1, 1), use_bias=False, dtype=self.dtype, name='to_qkv.conv_0'
         )(x)
         q, k, v = jnp.split(qkv, 3, axis=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b d h w (h d) -> b (d h w) h d', h=self.heads), (q, k, v))
+        q, k, v = map(lambda t: rearrange(t, 'b d H_spatial w (h d_head) -> b (d H_spatial w) h d_head', h=self.heads, d_head=self.dim_head), (q, k, v))
         assert q.shape == k.shape == v.shape == (B, D * H * W, self.heads, self.dim_head)
         q = q / jnp.clip(jnp.linalg.norm(q, ord=2, axis=-1, keepdims=True), a_min=1e-12)
         k = k / jnp.clip(jnp.linalg.norm(k, ord=2, axis=-1, keepdims=True), a_min=1e-12)
         sim = jnp.einsum('b i h d, b j h d -> b h i j', q, k) * self.scale
         attn = nn.softmax(sim, axis=-1)
         out = jnp.einsum('b h i j, b j h d -> b h i d', attn, v)
-        out = rearrange(out, 'b h (d h w) d -> b d h w (h d)', d=D, h=H, w=W)
+        out = rearrange(out, 'b num_heads (s_d s_h s_w) head_d -> b s_d s_h s_w (num_heads head_d)', s_d=D, s_h=H, s_w=W)
         out = nn.Conv(features=C, kernel_size=(1, 1, 1), dtype=self.dtype, name='to_out.conv_0')(out)
         return out
 
@@ -262,7 +262,7 @@ class LinearAttention3D(nn.Module):
             features=dim * 3, kernel_size=(1, 1, 1), use_bias=False, dtype=self.dtype, name='to_qkv.conv_0'
         )(x)
         q, k, v = jnp.split(qkv, 3, axis=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b d h w (h d) -> b (d h w) h d', h=self.heads), (q, k, v))
+        q, k, v = map(lambda t: rearrange(t, 'b d H_spatial w (h d_head) -> b (d H_spatial w) h d_head', h=self.heads, d_head=self.dim_head), (q, k, v))
         assert q.shape == k.shape == v.shape == (B, D * H * W, self.heads, self.dim_head)
         q = nn.softmax(q, axis=-1)
         k = nn.softmax(k, axis=-3)
@@ -270,7 +270,7 @@ class LinearAttention3D(nn.Module):
         v = v / (D * H * W)
         context = jnp.einsum('b n h d, b n h e -> b h d e', k, v)
         out = jnp.einsum('b h d e, b n h d -> b h e n', context, q)
-        out = rearrange(out, 'b h e (d h w) -> b d h w (h e)', d=D, h=H, w=W)
+        out = rearrange(out, 'b num_h dim_h (spatial_d spatial_h spatial_w) -> b spatial_d spatial_h spatial_w (num_h dim_h)', spatial_d=D, spatial_h=H, spatial_w=W)
         out = nn.Conv(features=C, kernel_size=(1, 1, 1), dtype=self.dtype, name='to_out.conv_0')(out)
         out = nn.LayerNorm(epsilon=1e-5, use_bias=False, dtype=self.dtype, name='to_out.norm_0')(out)
         return out
@@ -338,9 +338,9 @@ class UNet3D(nn.Module):
             (batch_size, depth, height, width, out_dim).
     """
     dim: int
+    dim_mults: Tuple[int, ...]
     init_dim: Optional[int] = None
     out_dim: Optional[int] = None
-    dim_mults: Tuple[int, ...]
     resnet_block_groups: int = 8
     learned_variance: bool = False
     dtype: Any = jnp.float32

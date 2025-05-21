@@ -4,3 +4,6 @@ output/
 Chunky-Bukkit-1.4.36.jar
 server.jar
 wandb/
+worlds.tar.gz
+*.pyc
+__pycache__/

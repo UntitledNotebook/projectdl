@@ -175,7 +175,6 @@ def p_loss(rng: jax.random.PRNGKey, state: Any, batch: Dict[str, jnp.ndarray], d
     def compute_loss(params):
         pred = state.apply_fn({'params': params}, x_t, batched_t)
         loss = loss_fn(pred.reshape(B, -1), target.reshape(B, -1))
-        loss = jnp.mean(loss, axis=1)
         assert loss.shape == (B,)
         loss = loss * p2_loss_weight[batched_t]
         return loss.mean()
@@ -190,7 +189,7 @@ def p_loss(rng: jax.random.PRNGKey, state: Any, batch: Dict[str, jnp.ndarray], d
         grads = jax.lax.pmean(grads, axis_name=pmap_axis)
     loss = jax.lax.pmean(loss, axis_name=pmap_axis)
     loss_ema = jax.lax.pmean(compute_loss(state.params_ema), axis_name=pmap_axis)
-    metrics = {'loss': float(loss), 'loss_ema': float(loss_ema)}
+    metrics = {'loss': loss, 'loss_ema': loss_ema}
     new_state = state.apply_gradients(grads=grads)
     if dynamic_scale:
         new_state = new_state.replace(

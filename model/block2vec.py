@@ -7,9 +7,9 @@ from pathlib import Path
 import random
 from functools import partial
 import optax
+from optax import cosine_decay_schedule # Add this import
 from tqdm import tqdm
 import wandb
-from sklearn.manifold import TSNE
 import matplotlib.pyplot as plt
 import seaborn as sns
 import logging
@@ -17,6 +17,7 @@ import multiprocessing
 import os
 import itertools
 import time
+from openTSNE import TSNE
 
 # Configure logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(processName)s - %(message)s')
@@ -30,21 +31,21 @@ rng = jax.random.PRNGKey(42) # Initial JAX PRNG key for the main process
 
 # Configuration
 DATA_DIR = Path("data")
-OUTPUT_DIR = Path("output/block2vec")
+OUTPUT_DIR = Path(f"output/block2vec/{time.strftime('%Y%m%d_%H%M%S')}")
 NPY_FILE = DATA_DIR / "block_ids_32_32.npy"
 EMBEDDING_DIM = 8
-MAX_WINDOW_SIZE = 21
+MAX_WINDOW_SIZE = 11
 NEGATIVE_SAMPLES = 5
 SUBSAMPLE_THRESHOLD = 1e-5
-LEARNING_RATE = 0.025
+LEARNING_RATE = 0.020
 BATCH_SIZE = 1024
 MAX_STEPS = 5000
 WANDB_PROJECT = "projectdl"
 WANDB_GROUP = "block2vec"
-WANDB_TAG = ["baseline", "multiprocessing", "mmap"] # Added mmap tag
-CHECKPOINT_INTERVAL = 100
+WANDB_TAG = ["cosine"] # Added mmap tag
+CHECKPOINT_INTERVAL = 1000
 TSNE_SUBSAMPLE = 30
-NUM_WORKERS = max(1, os.cpu_count() // 2 if os.cpu_count() else 1)
+NUM_WORKERS = max(1, os.cpu_count() - 2)
 
 if not OUTPUT_DIR.exists():
     OUTPUT_DIR.mkdir(parents=True)
@@ -302,13 +303,13 @@ def visualize_embeddings(embeddings_np, id_to_snbt_map, block_counts_map, vocab_
         return
 
     # Ensure perplexity is less than the number of samples
-    perplexity_val = min(10, sub_embeddings_filtered.shape[0] - 1)
+    perplexity_val = min(8, sub_embeddings_filtered.shape[0] - 1)
     if perplexity_val <=0: # if only 1 sample after filtering
         logger.warning(f"TSNE: Perplexity value ({perplexity_val}) is too low. Skipping t-SNE.")
         return
 
-    tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity_val, max_iter=1000, init='pca', learning_rate='auto', n_jobs=-1) # use all cores for t-SNE
-    embeddings_2d = tsne.fit_transform(sub_embeddings_filtered)
+    tsne = TSNE(n_components=2, random_state=42, perplexity=perplexity_val, n_iter=1000, n_jobs=1) # use all cores for t-SNE
+    embeddings_2d = tsne.fit(sub_embeddings_filtered)
     
     plt.figure(figsize=(12, 10))
     sns.scatterplot(x=embeddings_2d[:, 0], y=embeddings_2d[:, 1], alpha=0.7, s=50)
@@ -357,12 +358,18 @@ def train_model(block_ids_data, subsample_probs_data, log_uniform_probs_data,
             "num_workers": NUM_WORKERS,
         },
         tags=WANDB_TAG,
-        reinit=True # Allow reinitialization if called multiple times in a session
     )
     
     current_jax_rng, model_init_rng = jax.random.split(initial_jax_rng)
     params, current_jax_rng = init_model(vocab_s, embedding_d, model_init_rng)
-    optimizer = optax.adam(LEARNING_RATE)
+    
+    # Define cosine learning rate schedule
+    lr_schedule = cosine_decay_schedule(
+        init_value=LEARNING_RATE,
+        decay_steps=max_s 
+    )
+    
+    optimizer = optax.adam(learning_rate=lr_schedule) # Use the schedule
     opt_state = optimizer.init(params)
     
     n_samples_data = block_ids_data.shape[0]
