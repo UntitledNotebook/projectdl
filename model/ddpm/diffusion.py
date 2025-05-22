@@ -25,11 +25,12 @@ def get_ddpm_params(config: Dict[str, Any]) -> Dict[str, Any]:
         beta_end = 0.02
         betas = jnp.linspace(beta_start, beta_end, timesteps)
     elif config['beta_schedule'] == 'cosine':
-        def f(t):
+        def f(t_norm):
             s = 0.008
-            return jnp.cos((t / timesteps + s) / (1 + s) * jnp.pi / 2) ** 2
+            return jnp.cos((t_norm + s) / (1 + s) * jnp.pi / 2) ** 2
+        
         steps = jnp.arange(timesteps + 1, dtype=jnp.float32) / timesteps
-        alphas_cumprod = f(steps) / f(0)
+        alphas_cumprod = f(steps) / f(0.0) 
         betas = 1 - alphas_cumprod[1:] / alphas_cumprod[:-1]
         betas = jnp.clip(betas, 0, 0.999)
     else:
@@ -104,7 +105,7 @@ def x0_to_noise(x0_pred: jnp.ndarray, x_t: jnp.ndarray, t: jnp.ndarray, ddpm_par
     """
     sqrt_alphas_cumprod = ddpm_params['sqrt_alphas_cumprod']
     sqrt_one_minus_alphas_cumprod = ddpm_params['sqrt_one_minus_alphas_cumprod']
-    return ((x_t - sqrt_alphas_cumprod[t][:, None, None, None] * x0_pred) /
+    return ((x_t - sqrt_alphas_cumprod[t][:, None, None, None, None] * x0_pred) /
             sqrt_one_minus_alphas_cumprod[t][:, None, None, None, None])
 
 def get_posterior_mean_variance(x_t: jnp.ndarray, t: jnp.ndarray, x0_pred: jnp.ndarray, noise_pred: jnp.ndarray,
@@ -262,8 +263,49 @@ def ddpm_sample_step(state: Any, rng: jax.random.PRNGKey, x: jnp.ndarray, t: jnp
 
 def ddpm_inpaint_sample_step(state: Any, rng: jax.random.PRNGKey, x: jnp.ndarray, t: jnp.ndarray, x0_last: jnp.ndarray,
                             ddpm_params: Dict[str, Any], self_condition: bool, is_pred_x0: bool, x_true: jnp.ndarray, mask: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
-    # This function can only be run on a single device, and both x and x_true should have batch_size=1
-    assert x.shape[0] == 1 and x.shape == x_true.shape == mask
+    """Performs one step of the DDPM inpainting reverse diffusion process.
+
+    This function takes the current noisy sample `x` at timestep `t`, the original clean data `x_true`,
+    and a `mask` indicating known (0) and unknown (1) regions. It predicts the sample at `t-1`.
+    For unknown regions, it uses the standard DDPM reverse step. For known regions, it
+    re-injects information from `x_true` by sampling from `q(x_{t-1} | x_0=x_true, x_t)`.
+
+    Args:
+        state (Any): The current training state (Flax TrainState), containing model parameters
+                     (and EMA parameters if `use_ema=True` in `model_predict`).
+                     This is expected to be replicated if used with pmap.
+        rng (jax.random.PRNGKey): JAX random key for noise generation during this step.
+                                  It's split internally for different noise sources.
+        x (jnp.ndarray): The current noisy sample at timestep `t`.
+                         Shape: (batch_size_per_device, *data_shape).
+        t (jnp.ndarray): The current timestep, a scalar JAX array (e.g., `DeviceArray(999)`).
+                         This is broadcasted to `batched_t` internally.
+        x0_last (jnp.ndarray): The model's prediction of `x_0` from the previous step (t+1),
+                               used for self-conditioning if `self_condition` is True.
+                               Shape: (batch_size_per_device, *data_shape).
+        ddpm_params (Dict[str, Any]): A dictionary containing precomputed DDPM schedule
+                                      parameters (betas, alphas, etc.).
+        self_condition (bool): If True, `x0_last` is concatenated to `x` as input to the model.
+        is_pred_x0 (bool): If True, the model is trained to predict `x_0`. Otherwise, it predicts noise.
+        x_true (jnp.ndarray): The original, clean data corresponding to `x`. This is used to
+                              provide known information for inpainting.
+                              Shape: (batch_size_per_device, *data_shape).
+        mask (jnp.ndarray): A binary mask with the same shape as `x` and `x_true`.
+                            Values are 1 for regions to be inpainted (unknown) and 0 for
+                            regions that are known (and should be preserved from `x_true`).
+                            Shape: (batch_size_per_device, *data_shape).
+
+    Returns:
+        Tuple[jnp.ndarray, jnp.ndarray]:
+            - x_prev_corrected (jnp.ndarray): The inpainted sample at timestep `t-1`.
+                                             Shape: (batch_size_per_device, *data_shape).
+            - x0 (jnp.ndarray): The model's current prediction of `x_0` at timestep `t`.
+                                Shape: (batch_size_per_device, *data_shape).
+    """
+    assert x.shape == x_true.shape == mask.shape, "Input shapes for x, x_true, and mask must match."
+    
+    rng_model_noise, rng_q_noise = jax.random.split(rng) # Split RNG key
+
     batched_t = jnp.ones((x.shape[0],), dtype=jnp.int32) * t # t is scalar here, x.shape[0] is batch_size_per_device
     if self_condition:
         x0, v = model_predict(state, x, x0_last, batched_t, ddpm_params, self_condition, is_pred_x0, use_ema=True)
@@ -271,20 +313,19 @@ def ddpm_inpaint_sample_step(state: Any, rng: jax.random.PRNGKey, x: jnp.ndarray
         x0, v = model_predict(state, x, None, batched_t, ddpm_params, self_condition, is_pred_x0, use_ema=True)
     # Pass batched_t to get_posterior_mean_variance instead of scalar t
     posterior_mean, posterior_log_variance = get_posterior_mean_variance(x, batched_t, x0, v, ddpm_params)
-    model_based_x_prev = posterior_mean + jnp.exp(0.5 * posterior_log_variance[:, None, None, None, None]) * jax.random.normal(rng, x.shape)
+    model_based_x_prev = posterior_mean + jnp.exp(0.5 * posterior_log_variance[:, None, None, None, None]) * jax.random.normal(rng_model_noise, x.shape)
     if t > 0:
         t_minus_1_batched = jnp.full((x.shape[0],), t - 1, dtype=jnp.int32)
-        noise_for_q = jax.random.normal(rng, x.shape)
+        noise_for_q = jax.random.normal(rng_q_noise, x.shape)
 
         known_region_x_prev = q_sample(
             x_true, t_minus_1_batched, noise_for_q, ddpm_params
         )
 
-        x_prev_corrected = model_based_x_prev * mask + known_region_x_prev * (1 - mask)
+        x_prev_corrected = model_based_x_prev * mask + known_region_x_prev * (1.0 - mask) # Ensure mask arithmetic is float
     else: # t == 0
-        x_prev_corrected = x0 * mask + x_true * (1 - mask)
+        x_prev_corrected = x0 * mask + x_true * (1.0 - mask) # Ensure mask arithmetic is float
     return x_prev_corrected, x0
-
 
 def sample_loop(rng: jax.random.PRNGKey, state: TrainState, shape: Tuple[int, ...], p_sample_step: callable, timesteps: int) -> jnp.ndarray:
     """Generates samples using the DDPM sampling loop.

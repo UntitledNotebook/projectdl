@@ -11,11 +11,11 @@ import wandb
 from flax import jax_utils
 from typing import Any, Dict, Tuple, Optional
 
-from model import UNet3D
-from train_state import TrainState
-from data import get_dataset
-from diffusion import p_loss, ddpm_sample_step, get_ddpm_params, sample_loop
-from utils import l2_loss, l1_loss, create_ema_decay_schedule, apply_ema_decay, copy_params_to_ema, save_checkpoint
+from .model import UNet3D  # Changed to relative import
+from .train_state import TrainState  # Changed to relative import
+from .data import get_dataset  # Changed to relative import
+from .diffusion import p_loss, ddpm_sample_step, get_ddpm_params, sample_loop  # Changed to relative import
+from .utils import l2_loss, l1_loss, create_ema_decay_schedule, apply_ema_decay, copy_params_to_ema, save_checkpoint  # Changed to relative import
 
 # Global Configurations
 MAX_STEP = 100
