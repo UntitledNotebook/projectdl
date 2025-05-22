@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from jax import tree_util # Import tree_util
 from typing import Dict, Any
 
 def l2_loss(pred: jnp.ndarray, target: jnp.ndarray) -> jnp.ndarray:
@@ -63,7 +64,7 @@ def apply_ema_decay(state: Any, decay: float) -> Any:
     """
     def update_ema(param, ema_param):
         return decay * ema_param + (1 - decay) * param
-    params_ema = jax.tree_map(update_ema, state.params, state.params_ema)
+    params_ema = tree_util.tree_map(update_ema, state.params, state.params_ema) # Changed jax.tree_map to tree_util.tree_map
     return state.replace(params_ema=params_ema)
 
 def copy_params_to_ema(state: Any) -> Any:

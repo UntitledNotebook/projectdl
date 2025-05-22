@@ -1,5 +1,6 @@
 import logging
 from train import train
+logging.basicConfig(level=logging.INFO)
 
 def main():
     """Main function to start training."""

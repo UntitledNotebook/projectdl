@@ -4,6 +4,7 @@ import functools
 from typing import Dict, Any, Tuple, Optional
 from flax.training.train_state import TrainState
 from flax import jax_utils
+from tqdm import tqdm # Import tqdm
 
 def get_ddpm_params(config: Dict[str, Any]) -> Dict[str, Any]:
     """Computes DDPM parameters for the diffusion process.
@@ -238,7 +239,7 @@ def ddpm_sample_step(state: Any, rng: jax.random.PRNGKey, x: jnp.ndarray, t: jnp
         state (Any): Training state with model parameters and apply_fn.
         rng (jax.random.PRNGKey): Random key for sampling noise.
         x (jnp.ndarray): Current sample, shape (batch_size, *shape).
-        t (jnp.ndarray): Current timestep, shape (batch_size,).
+        t (jnp.ndarray): Current timestep, scalar on each device.
         x0_last (jnp.ndarray): Previous x_0 estimate, shape (batch_size, *shape).
         ddpm_params (Dict[str, Any]): DDPM parameters.
         self_condition (bool): If True, uses self-conditioning.
@@ -247,14 +248,43 @@ def ddpm_sample_step(state: Any, rng: jax.random.PRNGKey, x: jnp.ndarray, t: jnp
     Returns:
         Tuple[jnp.ndarray, jnp.ndarray]: Updated sample and x_0 estimate, each shape (batch_size, *shape).
     """
-    batched_t = jnp.ones((x.shape[0],), dtype=jnp.int32) * t
+    batched_t = jnp.ones((x.shape[0],), dtype=jnp.int32) * t # t is scalar here, x.shape[0] is batch_size_per_device
     if self_condition:
         x0, v = model_predict(state, x, x0_last, batched_t, ddpm_params, self_condition, is_pred_x0, use_ema=True)
     else:
         x0, v = model_predict(state, x, None, batched_t, ddpm_params, self_condition, is_pred_x0, use_ema=True)
-    posterior_mean, posterior_log_variance = get_posterior_mean_variance(x, t, x0, v, ddpm_params)
-    x = posterior_mean + jnp.exp(0.5 * posterior_log_variance) * jax.random.normal(rng, x.shape)
+    # Pass batched_t to get_posterior_mean_variance instead of scalar t
+    posterior_mean, posterior_log_variance = get_posterior_mean_variance(x, batched_t, x0, v, ddpm_params)
+    # Expand posterior_log_variance to match noise shape
+    noise_scale = jnp.exp(0.5 * posterior_log_variance[:, None, None, None, None])
+    x = posterior_mean + noise_scale * jax.random.normal(rng, x.shape)
     return x, x0
+
+def ddpm_inpaint_sample_step(state: Any, rng: jax.random.PRNGKey, x: jnp.ndarray, t: jnp.ndarray, x0_last: jnp.ndarray,
+                            ddpm_params: Dict[str, Any], self_condition: bool, is_pred_x0: bool, x_true: jnp.ndarray, mask: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    # This function can only be run on a single device, and both x and x_true should have batch_size=1
+    assert x.shape[0] == 1 and x.shape == x_true.shape == mask
+    batched_t = jnp.ones((x.shape[0],), dtype=jnp.int32) * t # t is scalar here, x.shape[0] is batch_size_per_device
+    if self_condition:
+        x0, v = model_predict(state, x, x0_last, batched_t, ddpm_params, self_condition, is_pred_x0, use_ema=True)
+    else:
+        x0, v = model_predict(state, x, None, batched_t, ddpm_params, self_condition, is_pred_x0, use_ema=True)
+    # Pass batched_t to get_posterior_mean_variance instead of scalar t
+    posterior_mean, posterior_log_variance = get_posterior_mean_variance(x, batched_t, x0, v, ddpm_params)
+    model_based_x_prev = posterior_mean + jnp.exp(0.5 * posterior_log_variance[:, None, None, None, None]) * jax.random.normal(rng, x.shape)
+    if t > 0:
+        t_minus_1_batched = jnp.full((x.shape[0],), t - 1, dtype=jnp.int32)
+        noise_for_q = jax.random.normal(rng, x.shape)
+
+        known_region_x_prev = q_sample(
+            x_true, t_minus_1_batched, noise_for_q, ddpm_params
+        )
+
+        x_prev_corrected = model_based_x_prev * mask + known_region_x_prev * (1 - mask)
+    else: # t == 0
+        x_prev_corrected = x0 * mask + x_true * (1 - mask)
+    return x_prev_corrected, x0
+
 
 def sample_loop(rng: jax.random.PRNGKey, state: TrainState, shape: Tuple[int, ...], p_sample_step: callable, timesteps: int) -> jnp.ndarray:
     """Generates samples using the DDPM sampling loop.
@@ -272,7 +302,8 @@ def sample_loop(rng: jax.random.PRNGKey, state: TrainState, shape: Tuple[int, ..
     rng, x_rng = jax.random.split(rng)
     x = jax.random.normal(x_rng, shape)
     x0 = jnp.zeros_like(x)
-    for t in reversed(jnp.arange(timesteps)):
+    # Wrap the loop with tqdm for progress visualization
+    for t in tqdm(reversed(jnp.arange(timesteps)), desc="Sampling", total=timesteps):
         rng, *step_rng = jax.random.split(rng, num=jax.local_device_count() + 1)
         step_rng = jnp.asarray(step_rng)
         x, x0 = p_sample_step(state, step_rng, x, jax_utils.replicate(t), x0)

@@ -18,18 +18,18 @@ from diffusion import p_loss, ddpm_sample_step, get_ddpm_params, sample_loop
 from utils import l2_loss, l1_loss, create_ema_decay_schedule, apply_ema_decay, copy_params_to_ema, save_checkpoint
 
 # Global Configurations
-MAX_STEP = 100000
-DATA_PATH = "data/block_ids_3000.npy"  # Path to .npy file: (n_samples, 32, 32, 32), np.int32
+MAX_STEP = 100
+DATA_PATH = "data/block_ids_32_32.npy"  # Path to .npy file: (n_samples, 32, 32, 32), np.int32
 EMBEDDING_PATH = "output/block2vec/block_embeddings.npy"  # Path to .npy file: (num_blocks, embedding_dim)
 OUTPUT_DIR = "output/ddpm"  # Base directory for outputs
-CHECKPOINT_DIR = os.path.join(OUTPUT_DIR, "checkpoints")  # Subdir for model checkpoints
-SAMPLE_DIR = os.path.join(OUTPUT_DIR, "samples")  # Subdir for generated samples
+CHECKPOINT_DIR = os.path.abspath(os.path.join(OUTPUT_DIR, "checkpoints"))  # Subdir for model checkpoints
+SAMPLE_DIR = os.path.abspath(os.path.join(OUTPUT_DIR, "samples"))  # Subdir for generated samples
 SEED = 0
-BATCH_SIZE = 64
+BATCH_SIZE = 32
 VOXEL_SHAPE = (32, 32, 32)  # (depth, height, width)
-EMBEDDING_DIM = 8  # Matches embedding_dim in EMBEDDING_PATH
+EMBEDDING_DIM = 4  # Matches embedding_dim in EMBEDDING_PATH
 STANDARDIZE_EMBEDDINGS = True  # Whether to standardize embeddings (zero mean, unit variance)
-MODEL_DIM = 64
+MODEL_DIM = 32
 DIM_MULTS = (1, 2, 4)
 BETA_SCHEDULE = 'cosine'
 TIMESTEPS = 1000
@@ -39,15 +39,15 @@ P2_LOSS_WEIGHT_GAMMA = 1.0
 P2_LOSS_WEIGHT_K = 1.0
 HALF_PRECISION = False
 LOSS_TYPE = 'l2'
-LOG_EVERY_STEPS = 100
-SAVE_AND_SAMPLE_EVERY = 1000
+LOG_EVERY_STEPS = 1
+SAVE_AND_SAMPLE_EVERY = 10
 NUM_SAMPLE = 8
 LEARNING_RATE = 1e-4
 BETA1 = 0.9
 BETA2 = 0.999
 EPS = 1e-8
-EMA_UPDATE_AFTER_STEP = 1000
-EMA_UPDATE_EVERY = 10
+EMA_UPDATE_AFTER_STEP = 5
+EMA_UPDATE_EVERY = 1
 EMA_INV_GAMMA = 1.0
 EMA_POWER = 0.75
 EMA_MIN_VALUE = 0.0
