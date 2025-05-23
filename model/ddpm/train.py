@@ -1,265 +1,249 @@
-import os
-import time
-import logging
-import functools
-from tqdm import tqdm
-import jax
-import jax.numpy as jnp
+import torch
+import torch.optim as optim
 import numpy as np
-import optax
-import wandb
-from flax import jax_utils
+import os
+import logging
+import functools # For functools.partial
+from tqdm import tqdm
 from typing import Any, Dict, Tuple, Optional
 
-from .model import UNet3D  # Changed to relative import
-from .train_state import TrainState  # Changed to relative import
-from .data import get_dataset  # Changed to relative import
-from .diffusion import p_loss, ddpm_sample_step, get_ddpm_params, sample_loop  # Changed to relative import
-from .utils import l2_loss, l1_loss, create_ema_decay_schedule, apply_ema_decay, copy_params_to_ema, save_checkpoint  # Changed to relative import
+from .model import UNet3D
+from .data import get_dataset 
+from .diffusion import p_loss, get_ddpm_params, sample_loop, ddpm_sample_step
+from .utils import create_ema_decay_schedule, apply_ema_decay, copy_params_to_ema, save_checkpoint
 
-# Global Configurations
-MAX_STEP = 100
-DATA_PATH = "data/block_ids_32_32.npy"  # Path to .npy file: (n_samples, 32, 32, 32), np.int32
-EMBEDDING_PATH = "output/block2vec/block_embeddings.npy"  # Path to .npy file: (num_blocks, embedding_dim)
-OUTPUT_DIR = "output/ddpm"  # Base directory for outputs
-CHECKPOINT_DIR = os.path.abspath(os.path.join(OUTPUT_DIR, "checkpoints"))  # Subdir for model checkpoints
-SAMPLE_DIR = os.path.abspath(os.path.join(OUTPUT_DIR, "samples"))  # Subdir for generated samples
-SEED = 0
-BATCH_SIZE = 32
-VOXEL_SHAPE = (32, 32, 32)  # (depth, height, width)
-EMBEDDING_DIM = 4  # Matches embedding_dim in EMBEDDING_PATH
-STANDARDIZE_EMBEDDINGS = True  # Whether to standardize embeddings (zero mean, unit variance)
-MODEL_DIM = 32
-DIM_MULTS = (1, 2, 4)
+# --- Global Configurations ---
+MAX_STEP = 100000
+DATA_PATH = "data/block_ids_32_32.npy"
+EMBEDDING_PATH = "output/block2vec/block_embeddings.npy"
+OUTPUT_DIR = "output/ddpm_minecraft_v4" # Incremented version
+CHECKPOINT_DIR = os.path.abspath(os.path.join(OUTPUT_DIR, "checkpoints"))
+SAMPLE_DIR = os.path.abspath(os.path.join(OUTPUT_DIR, "samples"))
+
+SEED = 42
+BATCH_SIZE = 8 
+VOXEL_SHAPE = (32, 32, 32)
+EMBEDDING_DIM = 64 
+STANDARDIZE_EMBEDDINGS = True
+
+# Model Config
+MODEL_DIM = 64
+DIM_MULTS = (1, 2, 4, 8)
+UNET_OUT_CHANNELS = EMBEDDING_DIM
+
+# Diffusion Config
 BETA_SCHEDULE = 'cosine'
 TIMESTEPS = 1000
-SELF_CONDITION = False
-PRED_X0 = False
-P2_LOSS_WEIGHT_GAMMA = 1.0
-P2_LOSS_WEIGHT_K = 1.0
-HALF_PRECISION = False
-LOSS_TYPE = 'l2'
-LOG_EVERY_STEPS = 1
-SAVE_AND_SAMPLE_EVERY = 10
-NUM_SAMPLE = 8
+SELF_CONDITION = True # This will be baked into the sampler_fn
+PRED_X0 = True 
+CLIP_DENOISED_VALUE = 1.0 if STANDARDIZE_EMBEDDINGS else None
+
+# Loss Config
+LOSS_TYPE = 'l1'
+P2_LOSS_WEIGHT_GAMMA = 0.0
+
+# Optimizer Config
 LEARNING_RATE = 1e-4
 BETA1 = 0.9
-BETA2 = 0.999
+BETA2 = 0.99
 EPS = 1e-8
-EMA_UPDATE_AFTER_STEP = 5
-EMA_UPDATE_EVERY = 1
+
+# EMA Config
+EMA_UPDATE_AFTER_STEP = 100
+EMA_UPDATE_EVERY = 10
 EMA_INV_GAMMA = 1.0
 EMA_POWER = 0.75
 EMA_MIN_VALUE = 0.0
 EMA_BETA = 0.9999
-WANDB_LOG_TRAIN = True
+
+# Logging & Saving Config
+LOG_EVERY_STEPS = 100
+SAVE_AND_SAMPLE_EVERY = 5000
+NUM_SAMPLE = 4
+
+# WANDB (Optional)
+WANDB_LOG_TRAIN = False
 WANDB_PROJECT = 'projectdl'
-WANDB_JOB_TYPE = 'train'
 WANDB_GROUP = 'ddpm'
-WANDB_TAG = ['debug']
+WANDB_TAGS = ['pytorch', 'debug']
+if SELF_CONDITION: WANDB_TAGS.append('self_cond')
+if PRED_X0: WANDB_TAGS.append('pred_x0')
 
-def create_model(model_cls, half_precision: bool) -> Any:
-    """Creates the UNet3D model with specified precision.
 
-    Args:
-        model_cls (Any): Model class (UNet3D).
-        half_precision (bool): If True, use half-precision (bfloat16 on TPU, float16 on GPU).
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    Returns:
-        Any: Instantiated model.
-    """
-    platform = jax.local_devices()[0].platform
-    model_dtype = jnp.bfloat16 if half_precision and platform == 'tpu' else jnp.float16 if half_precision else jnp.float32
-    return model_cls(dtype=model_dtype, dim=MODEL_DIM, out_dim=EMBEDDING_DIM, dim_mults=DIM_MULTS)
+def create_model_and_optimizer(
+    device: torch.device
+) -> Tuple[torch.nn.Module, torch.optim.Optimizer]:
+    unet_in_channels_main_path = EMBEDDING_DIM * 2 if SELF_CONDITION else EMBEDDING_DIM
+    
+    model = UNet3D(
+        dim=MODEL_DIM,
+        dim_mults=DIM_MULTS,
+        in_channels=unet_in_channels_main_path, 
+        out_dim=UNET_OUT_CHANNELS,    
+        resnet_block_groups=8,        
+        use_linear_attention=True,    
+        attn_heads=4,                 
+        attn_dim_head=32              
+    ).to(device)
 
-def initialized(key: jax.random.PRNGKey, voxel_shape: Tuple[int, ...], model: Any) -> Dict[str, Any]:
-    """Initializes model parameters.
-
-    Args:
-        key (jax.random.PRNGKey): Random key for initialization.
-        voxel_shape (Tuple[int, ...]): Shape of voxel grid including embedding dimension.
-        model (Any): Model instance.
-
-    Returns:
-        Dict[str, Any]: Initialized parameters.
-    """
-    input_shape = (1, *voxel_shape)
-    @jax.jit
-    def init(*args):
-        return model.init(*args)
-    variables = init(
-        {'params': key},
-        jnp.ones(input_shape, model.dtype),
-        jnp.ones(input_shape[:1], model.dtype)
-    )
-    return variables['params']
-
-def create_train_state(rng: jax.random.PRNGKey) -> TrainState:
-    """Creates the initial training state.
-
-    Args:
-        rng (jax.random.PRNGKey): Random key for initialization.
-
-    Returns:
-        TrainState: Initial training state.
-    """
-    from flax.training import dynamic_scale as dynamic_scale_lib
-    dynamic_scale = dynamic_scale_lib.DynamicScale() if HALF_PRECISION and jax.local_devices()[0].platform == 'gpu' else None
-    model = create_model(model_cls=UNet3D, half_precision=HALF_PRECISION)
-    rng, rng_params = jax.random.split(rng)
-    params = initialized(rng_params, (*VOXEL_SHAPE, EMBEDDING_DIM), model)
-    tx = optax.adam(learning_rate=LEARNING_RATE, b1=BETA1, b2=BETA2, eps=EPS)
-    return TrainState.create(
-        apply_fn=model.apply,
-        params=params,
-        tx=tx,
-        params_ema=params,
-        dynamic_scale=dynamic_scale
-    )
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE, betas=(BETA1, BETA2), eps=EPS)
+    return model, optimizer
 
 def train():
-    """Trains the diffusion model for Minecraft landscape generation."""
-    if WANDB_LOG_TRAIN and jax.process_index() == 0:
-        wandb_config = {
-            'seed': SEED,
-            'data': {
-                'batch_size': BATCH_SIZE,
-                'voxel_shape': VOXEL_SHAPE,
-                'embedding_dim': EMBEDDING_DIM,
-                'standardize_embeddings': STANDARDIZE_EMBEDDINGS,
-            },
-            'model': {
-                'dim': MODEL_DIM,
-                'dim_mults': DIM_MULTS
-            },
-            'ddpm': {
-                'beta_schedule': BETA_SCHEDULE,
-                'timesteps': TIMESTEPS,
-                'self_condition': SELF_CONDITION,
-                'pred_x0': PRED_X0,
-                'p2_loss_weight_gamma': P2_LOSS_WEIGHT_GAMMA,
-                'p2_loss_weight_k': P2_LOSS_WEIGHT_K
-            },
-            'training': {
-                'half_precision': HALF_PRECISION,
-                'num_train_steps': MAX_STEP,
-                'log_every_steps': LOG_EVERY_STEPS,
-                'save_and_sample_every': SAVE_AND_SAMPLE_EVERY,
-                'num_sample': NUM_SAMPLE,
-                'loss_type': LOSS_TYPE
-            },
-            'optim': {
-                'lr': LEARNING_RATE,
-                'beta1': BETA1,
-                'beta2': BETA2,
-                'eps': EPS
-            },
-            'ema': {
-                'update_after_step': EMA_UPDATE_AFTER_STEP,
-                'update_every': EMA_UPDATE_EVERY,
-                'inv_gamma': EMA_INV_GAMMA,
-                'power': EMA_POWER,
-                'min_value': EMA_MIN_VALUE,
-                'beta': EMA_BETA
-            }
-        }
-        wandb.init(
-            project=WANDB_PROJECT,
-            group=WANDB_GROUP,
-            job_type=WANDB_JOB_TYPE,
-            tags=WANDB_TAG,
-            config=wandb_config
-        )
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+    
+    if WANDB_LOG_TRAIN:
+        try:
+            import wandb
+            wandb.init(project=WANDB_PROJECT, group=WANDB_GROUP, tags=WANDB_TAGS, config=globals())
+        except ImportError:
+            logging.warning("wandb not installed, skipping wandb logging.")
+            global WANDB_LOG_TRAIN
+            WANDB_LOG_TRAIN = False
+        
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     os.makedirs(SAMPLE_DIR, exist_ok=True)
-    rng = jax.random.PRNGKey(SEED)
-    rng, d_rng = jax.random.split(rng)
-    get_batch = get_dataset(d_rng, DATA_PATH, EMBEDDING_PATH, BATCH_SIZE, VOXEL_SHAPE, EMBEDDING_DIM, STANDARDIZE_EMBEDDINGS)
-    rng, state_rng = jax.random.split(rng)
-    state = create_train_state(state_rng)
-    from flax.training import checkpoints
-    state = checkpoints.restore_checkpoint(CHECKPOINT_DIR, state)
-    if jax.process_index() == 0:
-        unreplicated_params = jax_utils.unreplicate(state.params)
-        param_count = sum(x.size for x in jax.tree_util.tree_leaves(unreplicated_params))
-        logging.info(f"Total number of parameters: {param_count}")
-        if WANDB_LOG_TRAIN:
-            wandb.summary['total_parameters'] = param_count
-    step_offset = int(state.step)
-    state = jax_utils.replicate(state)
-    loss_fn = l2_loss if LOSS_TYPE == 'l2' else l1_loss
-    ddpm_params = get_ddpm_params({
-        'beta_schedule': BETA_SCHEDULE,
-        'timesteps': TIMESTEPS,
-        'p2_loss_weight_gamma': P2_LOSS_WEIGHT_GAMMA,
-        'p2_loss_weight_k': P2_LOSS_WEIGHT_K
-    })
+    
+    torch.manual_seed(SEED)
+    np.random.seed(SEED)
+    if DEVICE.type == 'cuda':
+        torch.cuda.manual_seed_all(SEED)
+
+    logging.info(f"Using device: {DEVICE}")
+    logging.info(f"Self-conditioning globally enabled for training/sampling: {SELF_CONDITION}")
+    logging.info(f"Model predicting x0: {PRED_X0}")
+
+    dataloader = get_dataset(
+        data_path=DATA_PATH, embedding_path=EMBEDDING_PATH, batch_size=BATCH_SIZE,
+        voxel_shape=VOXEL_SHAPE, embedding_dim=EMBEDDING_DIM,
+        standardize_embeddings=STANDARDIZE_EMBEDDINGS, num_workers=0, shuffle=True
+    )
+
+    model, optimizer = create_model_and_optimizer(DEVICE)
+    
+    # EMA model should also have its in_channels set according to SELF_CONDITION
+    unet_in_channels_ema_main_path = EMBEDDING_DIM * 2 if SELF_CONDITION else EMBEDDING_DIM
+    ema_model = UNet3D(
+        dim=MODEL_DIM, dim_mults=DIM_MULTS, in_channels=unet_in_channels_ema_main_path,
+        out_dim=UNET_OUT_CHANNELS, resnet_block_groups=8, use_linear_attention=True,
+        attn_heads=4, attn_dim_head=32
+    ).to(DEVICE)
+    copy_params_to_ema(model, ema_model)
+    ema_model.eval()
+
+    start_step = 0
+    latest_checkpoint_path = os.path.join(CHECKPOINT_DIR, "checkpoint_latest.pth")
+    if os.path.exists(latest_checkpoint_path):
+        logging.info(f"Restoring checkpoint from {latest_checkpoint_path}")
+        try:
+            checkpoint_data = torch.load(latest_checkpoint_path, map_location=DEVICE)
+            model.load_state_dict(checkpoint_data['model_state_dict'])
+            optimizer.load_state_dict(checkpoint_data['optimizer_state_dict'])
+            ema_model.load_state_dict(checkpoint_data['ema_model_state_dict'])
+            start_step = checkpoint_data['step'] + 1
+            logging.info(f"Restored checkpoint. Starting from step {start_step}")
+        except Exception as e:
+            logging.error(f"Could not load checkpoint: {e}. Starting from scratch.")
+            start_step = 0
+
+    ddpm_params_config = {
+        'beta_schedule': BETA_SCHEDULE, 'timesteps': TIMESTEPS,
+        'p2_loss_weight_gamma': P2_LOSS_WEIGHT_GAMMA, 'device': DEVICE
+    }
+    if BETA_SCHEDULE == 'linear':
+        ddpm_params_config['beta_start'] = 0.0001 
+        ddpm_params_config['beta_end'] = 0.02   
+    elif BETA_SCHEDULE == 'cosine':
+        ddpm_params_config['cosine_s'] = 0.008 
+    ddpm_params = get_ddpm_params(ddpm_params_config)
+
     ema_decay_fn = create_ema_decay_schedule({
-        'update_after_step': EMA_UPDATE_AFTER_STEP,
-        'update_every': EMA_UPDATE_EVERY,
-        'inv_gamma': EMA_INV_GAMMA,
-        'power': EMA_POWER,
-        'min_value': EMA_MIN_VALUE,
-        'beta': EMA_BETA
+        'update_after_step': EMA_UPDATE_AFTER_STEP, 'update_every': EMA_UPDATE_EVERY,
+        'inv_gamma': EMA_INV_GAMMA, 'power': EMA_POWER,
+        'min_value': EMA_MIN_VALUE, 'beta': EMA_BETA
     })
-    train_step = functools.partial(
-        p_loss, ddpm_params=ddpm_params, loss_fn=loss_fn,
-        self_condition=SELF_CONDITION, is_pred_x0=PRED_X0, pmap_axis='batch'
-    )
-    p_train_step = jax.pmap(train_step, axis_name='batch')
-    p_apply_ema = jax.pmap(apply_ema_decay, in_axes=(0, None), axis_name='batch')
-    p_copy_params_to_ema = jax.pmap(copy_params_to_ema, axis_name='batch')
-    sample_step = functools.partial(
-        ddpm_sample_step, ddpm_params=ddpm_params,
-        self_condition=SELF_CONDITION, is_pred_x0=PRED_X0
-    )
-    p_sample_step = jax.pmap(sample_step, axis_name='batch')
-    train_metrics = []
-    train_metrics_last_t = time.time()
-    logging.info('Initial compilation, this might take some minutes...')
-    for step in tqdm(range(step_offset, MAX_STEP)):
-        rng, *train_step_rng = jax.random.split(rng, num=jax.local_device_count() + 1)
-        train_step_rng = jnp.asarray(train_step_rng)
-        batch = get_batch()
-        state, metrics = p_train_step(train_step_rng, state, batch)
-        if step == step_offset:
-            logging.info('Initial compilation completed.')
-            logging.info(f"Number of devices: {batch['voxel'].shape[0]}")
-            logging.info(f"Batch size per device: {batch['voxel'].shape[1]}")
-            logging.info(f"Input shape: {batch['voxel'].shape[2:]}")
-        if (step + 1) <= EMA_UPDATE_AFTER_STEP:
-            state = p_copy_params_to_ema(state)
-        elif (step + 1) % EMA_UPDATE_EVERY == 0:
-            ema_decay = ema_decay_fn(step)
-            logging.info(f'Update EMA parameters with decay rate {ema_decay}')
-            state = p_apply_ema(state, ema_decay)
-        if LOG_EVERY_STEPS:
-            train_metrics.append(metrics)
-            if (step + 1) % LOG_EVERY_STEPS == 0:
-                summary = {}
-                for k in train_metrics[0].keys():
-                    vals = np.array([m[k] for m in train_metrics])
-                    summary[f'train/{k}'] = float(vals.mean())
-                summary['time/seconds_per_step'] = (time.time() - train_metrics_last_t) / LOG_EVERY_STEPS
-                train_metrics = []
-                train_metrics_last_t = time.time()
-                if WANDB_LOG_TRAIN:
-                    wandb.log({"train/step": step + 1, **summary})
-        if (step + 1) % SAVE_AND_SAMPLE_EVERY == 0 or step + 1 == MAX_STEP:
-            logging.info('Generating samples...')
-            samples = []
-            for i in range(0, NUM_SAMPLE, BATCH_SIZE):
-                rng, sample_rng = jax.random.split(rng)
-                samples.append(sample_loop(
-                    sample_rng, state,
-                    (jax.local_device_count(), BATCH_SIZE // jax.local_device_count(), *VOXEL_SHAPE, EMBEDDING_DIM),
-                    p_sample_step, TIMESTEPS
-                ))
-            samples = jnp.concatenate(samples)
-            this_sample_dir = os.path.join(SAMPLE_DIR, f"iter_{step}_host_{jax.process_index()}")
-            os.makedirs(this_sample_dir, exist_ok=True)
-            samples_array = np.array(samples)
-            np.save(os.path.join(this_sample_dir, "sample.npy"), samples_array)
-            save_checkpoint(state, CHECKPOINT_DIR)
-    jax.random.normal(jax.random.PRNGKey(0), ()).block_until_ready()
-    return state
+    
+    model.train()
+    step = start_step
+    progress_bar = tqdm(initial=step, total=MAX_STEP, desc="Training Progress", dynamic_ncols=True)
+    data_iter = iter(dataloader)
+    
+    while step < MAX_STEP:
+        try:
+            x_start = next(data_iter).to(DEVICE) 
+        except StopIteration:
+            data_iter = iter(dataloader)
+            x_start = next(data_iter).to(DEVICE)
+
+        t_rand = torch.randint(0, ddpm_params['timesteps'], (x_start.shape[0],), device=DEVICE).long()
+
+        optimizer.zero_grad(set_to_none=True)
+        
+        loss = p_loss(model, x_start, t_rand, ddpm_params,
+                      loss_type=LOSS_TYPE, self_condition=SELF_CONDITION,
+                      pred_x0=PRED_X0, p2_loss_weight_gamma=P2_LOSS_WEIGHT_GAMMA)
+        loss.backward()
+        optimizer.step()
+
+        if step >= EMA_UPDATE_AFTER_STEP and step % EMA_UPDATE_EVERY == 0:
+            current_ema_decay = ema_decay_fn(step)
+            apply_ema_decay(model, ema_model, current_ema_decay)
+
+        if step % LOG_EVERY_STEPS == 0:
+            log_data = {'step': step, 'loss': loss.item()}
+            logging.info(f"Step: {step}, Loss: {loss.item():.4f}")
+            if WANDB_LOG_TRAIN:
+                wandb.log(log_data, step=step)
+
+        if step > 0 and step % SAVE_AND_SAMPLE_EVERY == 0 :
+            logging.info(f"Saving checkpoint and generating samples at step {step}...")
+            save_checkpoint(
+                model=model, optimizer=optimizer, step=step, checkpoint_dir=CHECKPOINT_DIR,
+                ema_model=ema_model, filename_prefix="checkpoint"
+            )
+            
+            ema_model.eval()
+            # SELF_CONDITION is now part of the partial function for ddpm_sample_step
+            sampler_step_fn = functools.partial(
+                ddpm_sample_step, 
+                model=ema_model, 
+                ddpm_params=ddpm_params, 
+                pred_x0=PRED_X0,
+                self_condition=SELF_CONDITION # Baked into the sampler_fn
+            )
+            
+            sampler_kwargs = {}
+            if CLIP_DENOISED_VALUE is not None:
+                 sampler_kwargs['clip_denoised_value'] = CLIP_DENOISED_VALUE
+
+            # sample_loop no longer takes self_condition directly
+            samples = sample_loop(
+                shape=(NUM_SAMPLE, UNET_OUT_CHANNELS, *VOXEL_SHAPE),
+                timesteps=ddpm_params['timesteps'], device=DEVICE,
+                sampler_fn=sampler_step_fn, 
+                # initial_voxel can be passed if needed
+                progress_desc=f"Sampling at step {step}", 
+                **sampler_kwargs
+            )
+            
+            sample_save_path = os.path.join(SAMPLE_DIR, f"sample_step_{step}.npy")
+            np.save(sample_save_path, samples.cpu().numpy())
+            logging.info(f"Saved {NUM_SAMPLE} samples to {sample_save_path}")
+            
+            if WANDB_LOG_TRAIN:
+                wandb.log({"samples_saved_path": sample_save_path}, step=step)
+            model.train()
+            
+        step += 1
+        progress_bar.update(1)
+        progress_bar.set_postfix(loss=loss.item())
+
+    progress_bar.close()
+    logging.info("Training finished.")
+    if WANDB_LOG_TRAIN:
+        wandb.finish()
+
+if __name__ == '__main__':
+    train()

@@ -1,396 +1,573 @@
-import jax
-import jax.numpy as jnp
-import flax.linen as nn
-from typing import Any, Optional, Tuple
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 from einops import rearrange
+from typing import Any, Optional, Tuple
 
 class SinusoidalPosEmb(nn.Module):
-    """Generates sinusoidal positional embeddings for diffusion timesteps.
+    """
+    Generates sinusoidal positional embeddings for diffusion timesteps.
 
-    Takes a batch of timestep indices and produces sinusoidal embeddings used to
-    condition the UNet on the diffusion process's time step.
-
-    Attributes:
-        dim (int): The dimensionality of the output embeddings. Must be even.
-        dtype (Any): The data type of the embeddings (default: jnp.float32).
+    These embeddings are used to condition the UNet on the current diffusion step,
+    allowing the model to behave differently at different stages of the process.
 
     Args:
-        time (jnp.ndarray): Timestep indices, shape (batch_size,).
-
-    Returns:
-        jnp.ndarray: Sinusoidal embeddings, shape (batch_size, dim).
+        dim (int): The dimensionality of the output embeddings. Must be an even number.
     """
-    dim: int
-    dtype: Any = jnp.float32
+    def __init__(self, dim: int):
+        super().__init__()
+        if dim % 2 != 0:
+            raise ValueError(f"Dimension for SinusoidalPosEmb must be even, got {dim}")
+        self.dim = dim
 
-    @nn.compact
-    def __call__(self, time):
-        assert len(time.shape) == 1
+    def forward(self, time: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            time (torch.Tensor): A 1D tensor of timestep indices. Shape: (B,).
+
+        Returns:
+            torch.Tensor: Sinusoidal positional embeddings. Shape: (B, dim).
+        """
+        if time.ndim != 1:
+            raise ValueError(f"Input time tensor must be 1D, got shape {time.shape}")
+        
+        device = time.device
         half_dim = self.dim // 2
-        emb = jnp.log(10000) / (half_dim - 1)
-        emb = jnp.exp(jnp.arange(half_dim, dtype=self.dtype) * -emb)
-        emb = time.astype(self.dtype)[:, None] * emb[None, :]
-        emb = jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
+        # Precompute the frequency term (div_term)
+        # Formula: exp(arange(0, half_dim) * -(log(10000.0) / (half_dim - 1)))
+        emb = np.log(10000) / (half_dim - 1 if half_dim > 1 else 1) # Avoid division by zero if half_dim is 1
+        emb = torch.exp(torch.arange(half_dim, device=device, dtype=torch.float32) * -emb)
+        
+        # emb shape: (half_dim,)
+        # time shape: (B,) -> time[:, None] shape: (B, 1)
+        # emb[None, :] shape: (1, half_dim)
+        # Broadcasting results in (B, half_dim)
+        emb = time[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1) # Concatenate sin and cos components
         return emb
 
-class WeightStandardizedConv3D(nn.Module):
-    """Applies a 3D convolution with weight standardization.
-
-    Standardizes the convolution kernel weights by subtracting the mean and
-    dividing by the standard deviation, improving training stability.
-
-    Attributes:
-        features (int): Number of output channels.
-        kernel_size (Tuple[int, int, int]): Size of the 3D convolution kernel
-            (default: (3, 3, 3)).
-        strides (Tuple[int, int, int]): Stride of the convolution
-            (default: (1, 1, 1)).
-        padding (Any): Padding for the convolution (default: ((1, 1), (1, 1), (1, 1))).
-        dtype (Any): Data type for computations (default: jnp.float32).
-        param_dtype (Any): Data type for parameters (default: jnp.float32).
-
-    Args:
-        x (jnp.ndarray): Input tensor, shape (batch_size, depth, height, width, channels).
-
-    Returns:
-        jnp.ndarray: Output tensor, shape (batch_size, depth', height', width', features).
+class WeightStandardizedConv3d(nn.Conv3d):
     """
-    features: int
-    kernel_size: Tuple[int, int, int] = (3, 3, 3)
-    strides: Tuple[int, int, int] = (1, 1, 1)
-    padding: Any = ((1, 1), (1, 1), (1, 1))
-    dtype: Any = jnp.float32
-    param_dtype: Any = jnp.float32
+    Applies a 3D convolution with weight standardization.
 
-    @nn.compact
-    def __call__(self, x):
-        x = x.astype(self.dtype)
-        conv = nn.Conv(
-            features=self.features,
-            kernel_size=self.kernel_size,
-            strides=self.strides,
-            padding=self.padding,
-            dtype=self.dtype,
-            param_dtype=self.param_dtype,
-            parent=None
-        )
-        kernel_init = lambda rng, x: conv.init(rng, x)['params']['kernel']
-        bias_init = lambda rng, x: conv.init(rng, x)['params']['bias']
-        kernel = self.param('kernel', kernel_init, x)
-        eps = 1e-5 if self.dtype == jnp.float32 else 1e-3
-        redux = tuple(range(kernel.ndim - 1))
-        mean = jnp.mean(kernel, axis=redux, dtype=self.dtype, keepdims=True)
-        var = jnp.var(kernel, axis=redux, dtype=self.dtype, keepdims=True)
-        standardized_kernel = (kernel - mean) / jnp.sqrt(var + eps)
-        bias = self.param('bias', bias_init, x)
-        return conv.apply({'params': {'kernel': standardized_kernel, 'bias': bias}}, x)
+    Weight standardization helps stabilize training by normalizing the weights
+    of the convolutional kernel. It subtracts the mean and divides by the
+    standard deviation of the weights.
+
+    Inherits from nn.Conv3d, so all its arguments are accepted.
+    """
+    def __init__(self, in_channels: int, out_channels: int, kernel_size: Tuple[int, int, int] = (3, 3, 3),
+                 stride: Tuple[int, int, int] = (1, 1, 1), padding: Any = 1, 
+                 dilation: Tuple[int, int, int] = (1, 1, 1), groups: int = 1, bias: bool = True):
+        super().__init__(in_channels, out_channels, kernel_size, stride=stride, padding=padding, 
+                         dilation=dilation, groups=groups, bias=bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor. Shape: (B, C_in, D_in, H_in, W_in).
+
+        Returns:
+            torch.Tensor: Output tensor. Shape: (B, C_out, D_out, H_out, W_out).
+        """
+        weight = self.weight
+        # Standardize weights: (weight - mean) / (std + eps)
+        # Calculate mean and std across output channels and spatial dimensions of the kernel
+        weight_mean = weight.mean(dim=[1, 2, 3, 4], keepdim=True)
+        weight_std = weight.std(dim=[1, 2, 3, 4], keepdim=True) + 1e-5 # Add epsilon for numerical stability
+        weight = (weight - weight_mean) / weight_std
+        
+        return F.conv3d(x, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
 
 class Downsample3D(nn.Module):
-    """Downsamples a 3D tensor using a strided convolution.
+    """
+    Downsamples a 3D tensor using a strided convolution.
 
-    Reduces the spatial dimensions (depth, height, width) by a factor of 2 using
-    a 4x4x4 convolution with stride 2.
-
-    Attributes:
-        dim (Optional[int]): Number of output channels. If None, matches input channels.
-        dtype (Any): Data type for computations (default: jnp.float32).
+    This module reduces the spatial dimensions (depth, height, width) typically by a factor of 2.
 
     Args:
-        x (jnp.ndarray): Input tensor, shape (batch_size, depth, height, width, channels).
-
-    Returns:
-        jnp.ndarray: Downsampled tensor, shape (batch_size, depth//2, height//2, width//2, dim).
+        in_channels (int): Number of input channels.
+        out_channels (Optional[int]): Number of output channels. If None, defaults to `in_channels`.
+        kernel_size (int): Kernel size for the convolution. Default is 4.
+        stride (int): Stride for the convolution. Default is 2.
+        padding (int): Padding for the convolution. Default is 1.
     """
-    dim: Optional[int] = None
-    dtype: Any = jnp.float32
+    def __init__(self, in_channels: int, out_channels: Optional[int] = None, 
+                 kernel_size: int = 4, stride: int = 2, padding: int = 1):
+        super().__init__()
+        self.out_channels = out_channels if out_channels is not None else in_channels
+        self.conv = nn.Conv3d(in_channels, self.out_channels, 
+                              kernel_size=kernel_size, stride=stride, padding=padding)
 
-    @nn.compact
-    def __call__(self, x):
-        B, D, H, W, C = x.shape
-        dim = self.dim if self.dim is not None else C
-        x = nn.Conv(
-            dim, kernel_size=(4, 4, 4), strides=(2, 2, 2), padding=((1, 1), (1, 1), (1, 1)), dtype=self.dtype
-        )(x)
-        assert x.shape == (B, D // 2, H // 2, W // 2, dim)
-        return x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor. Shape: (B, C_in, D_in, H_in, W_in).
+
+        Returns:
+            torch.Tensor: Downsampled tensor. Shape: (B, C_out, D_out, H_out, W_out).
+        """
+        return self.conv(x)
 
 class Upsample3D(nn.Module):
-    """Upsamples a 3D tensor using nearest-neighbor interpolation and convolution.
+    """
+    Upsamples a 3D tensor using nearest-neighbor interpolation followed by a convolution.
 
-    Increases spatial dimensions (depth, height, width) by a factor of 2 using
-    nearest-neighbor interpolation, followed by a 3x3x3 convolution.
-
-    Attributes:
-        dim (Optional[int]): Number of output channels. If None, matches input channels.
-        dtype (Any): Data type for computations (default: jnp.float32).
+    This module increases the spatial dimensions (depth, height, width) typically by a factor of 2.
 
     Args:
-        x (jnp.ndarray): Input tensor, shape (batch_size, depth, height, width, channels).
-
-    Returns:
-        jnp.ndarray: Upsampled tensor, shape (batch_size, depth*2, height*2, width*2, dim).
+        in_channels (int): Number of input channels.
+        out_channels (Optional[int]): Number of output channels. If None, defaults to `in_channels`.
+        scale_factor (int): Multiplier for spatial dimensions. Default is 2.
     """
-    dim: Optional[int] = None
-    dtype: Any = jnp.float32
+    def __init__(self, in_channels: int, out_channels: Optional[int] = None, scale_factor: int = 2):
+        super().__init__()
+        self.out_channels = out_channels if out_channels is not None else in_channels
+        self.upsample = nn.Upsample(scale_factor=scale_factor, mode='nearest')
+        # Convolution after upsampling to refine features
+        self.conv = nn.Conv3d(in_channels, self.out_channels, kernel_size=3, padding=1)
 
-    @nn.compact
-    def __call__(self, x):
-        B, D, H, W, C = x.shape
-        dim = self.dim if self.dim is not None else C
-        x = jax.image.resize(x, (B, D * 2, H * 2, W * 2, C), 'nearest')
-        x = nn.Conv(
-            dim, kernel_size=(3, 3, 3), padding=((1, 1), (1, 1), (1, 1)), dtype=self.dtype
-        )(x)
-        assert x.shape == (B, D * 2, H * 2, W * 2, dim)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor. Shape: (B, C_in, D_in, H_in, W_in).
+
+        Returns:
+            torch.Tensor: Upsampled tensor. Shape: (B, C_out, D_out, H_out, W_out).
+        """
+        x = self.upsample(x)
+        x = self.conv(x)
         return x
 
 class ResnetBlock3D(nn.Module):
-    """A 3D residual block with time-conditioned normalization.
+    """
+    A 3D residual block with time conditioning and group normalization.
 
-    Applies two weight-standardized 3D convolutions with group normalization,
-    conditioned on time embeddings via scale and shift parameters. Includes a
-    residual connection.
-
-    Attributes:
-        dim (int): Number of output channels.
-        groups (Optional[int]): Number of groups for group normalization (default: 8).
-        dtype (Any): Data type for computations (default: jnp.float32).
+    This block consists of two convolutional layers with normalization and activation,
+    and a residual connection. Time embeddings can be incorporated to modulate
+    the features.
 
     Args:
-        x (jnp.ndarray): Input tensor, shape (batch_size, depth, height, width, channels).
-        time_emb (jnp.ndarray): Time embeddings, shape (batch_size, time_dim).
-
-    Returns:
-        jnp.ndarray: Output tensor, shape (batch_size, depth, height, width, dim).
+        in_channels (int): Number of input channels.
+        out_channels (int): Number of output channels.
+        time_emb_dim (Optional[int]): Dimensionality of the time embeddings. If None,
+                                      time conditioning is not applied.
+        groups (int): Number of groups for GroupNormalization. Default is 8.
+                      A common value is 32, ensure it divides `out_channels`.
     """
-    dim: int
-    groups: Optional[int] = 8
-    dtype: Any = jnp.float32
+    def __init__(self, in_channels: int, out_channels: int, *, 
+                 time_emb_dim: Optional[int] = None, groups: int = 8):
+        super().__init__()
 
-    @nn.compact
-    def __call__(self, x, time_emb):
-        B, D, H, W, C = x.shape
-        assert time_emb.shape[0] == B and len(time_emb.shape) == 2
-        h = WeightStandardizedConv3D(
-            features=self.dim, kernel_size=(3, 3, 3), padding=((1, 1), (1, 1), (1, 1)), name='conv_0'
-        )(x)
-        h = nn.GroupNorm(num_groups=self.groups, dtype=self.dtype, name='norm_0')(h)
-        time_emb = nn.Dense(features=2 * self.dim, dtype=self.dtype, name='time_mlp.dense_0')(nn.swish(time_emb))
-        time_emb = time_emb[:, None, None, None, :]  # [B, 1, 1, 1, 2*dim]
-        scale, shift = jnp.split(time_emb, 2, axis=-1)
-        h = h * (1 + scale) + shift
-        h = nn.swish(h)
-        h = WeightStandardizedConv3D(
-            features=self.dim, kernel_size=(3, 3, 3), padding=((1, 1), (1, 1), (1, 1)), name='conv_1'
-        )(h)
-        h = nn.swish(nn.GroupNorm(num_groups=self.groups, dtype=self.dtype, name='norm_1')(h))
-        if C != self.dim:
-            x = nn.Conv(
-                features=self.dim, kernel_size=(1, 1, 1), dtype=self.dtype, name='res_conv_0'
-            )(x)
-        assert x.shape == h.shape
-        return x + h
+        if out_channels % groups != 0:
+            # Fallback if groups don't divide out_channels, though ideally this should be configured correctly.
+            # Find the largest factor of out_channels <= groups, or use 1 if no common factor.
+            valid_groups = [g for g in range(1, groups + 1) if out_channels % g == 0]
+            actual_groups = valid_groups[-1] if valid_groups else 1
+            if actual_groups != groups:
+                print(f"Warning: ResnetBlock3D groups changed from {groups} to {actual_groups} for out_channels {out_channels}")
+            groups = actual_groups
+
+
+        self.mlp = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(time_emb_dim, out_channels * 2) # Output scale and shift parameters
+        ) if time_emb_dim is not None else None
+
+        self.block1_conv = WeightStandardizedConv3d(in_channels, out_channels, kernel_size=(3,3,3), padding=1)
+        self.norm1 = nn.GroupNorm(groups, out_channels)
+        self.act1 = nn.SiLU() # Swish activation
+
+        self.block2_conv = WeightStandardizedConv3d(out_channels, out_channels, kernel_size=(3,3,3), padding=1)
+        self.norm2 = nn.GroupNorm(groups, out_channels)
+        self.act2 = nn.SiLU()
+
+        # Residual connection: if in_channels != out_channels, use a 1x1 conv to match dimensions
+        self.res_conv = nn.Conv3d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else nn.Identity()
+
+    def forward(self, x: torch.Tensor, time_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor. Shape: (B, C_in, D, H, W).
+            time_emb (Optional[torch.Tensor]): Time embeddings. Shape: (B, time_emb_dim).
+
+        Returns:
+            torch.Tensor: Output tensor. Shape: (B, C_out, D, H, W).
+        """
+        h = self.block1_conv(x)
+        h = self.norm1(h)
+
+        if self.mlp is not None and time_emb is not None:
+            if time_emb.shape[0] != h.shape[0]:
+                raise ValueError("Batch size mismatch between input tensor and time embeddings.")
+            # time_emb: (B, time_emb_dim) -> mlp -> (B, out_channels * 2)
+            time_encoding = self.mlp(time_emb)
+            # Reshape for broadcasting: (B, out_channels * 2, 1, 1, 1)
+            time_encoding = time_encoding.view(h.shape[0], -1, 1, 1, 1)
+            # Split into scale and shift
+            scale, shift = time_encoding.chunk(2, dim=1) # Each (B, out_channels, 1, 1, 1)
+            h = h * (scale + 1) + shift # Apply scale and shift
+        
+        h = self.act1(h)
+        h = self.block2_conv(h)
+        h = self.norm2(h)
+        h = self.act2(h)
+
+        return h + self.res_conv(x) # Add residual connection
+
 
 class Attention3D(nn.Module):
-    """Standard 3D multi-head attention mechanism.
+    """
+    Standard 3D multi-head self-attention mechanism.
 
-    Computes attention over the 3D spatial dimensions (depth, height, width) using
-    multi-head self-attention with normalization.
-
-    Attributes:
-        heads (int): Number of attention heads (default: 4).
-        dim_head (int): Dimensionality of each head (default: 32).
-        scale (int): Scaling factor for attention scores (default: 10).
-        dtype (Any): Data type for computations (default: jnp.float32).
+    Computes attention over the 3D spatial dimensions (depth, height, width).
+    Uses Group Normalization before attention.
 
     Args:
-        x (jnp.ndarray): Input tensor, shape (batch_size, depth, height, width, channels).
-
-    Returns:
-        jnp.ndarray: Output tensor, shape (batch_size, depth, height, width, channels).
+        in_channels (int): Number of input channels.
+        heads (int): Number of attention heads. Default is 4.
+        dim_head (int): Dimensionality of each attention head. Default is 32.
+        groups_for_norm (int): Number of groups for the GroupNorm layer. Default is 32.
+                               Ensure this divides `in_channels`.
     """
-    heads: int = 4
-    dim_head: int = 32
-    scale: int = 10
-    dtype: Any = jnp.float32
+    def __init__(self, in_channels: int, heads: int = 4, dim_head: int = 32, groups_for_norm: int = 32):
+        super().__init__()
+        self.scale = dim_head ** -0.5 # For scaled dot-product attention
+        self.heads = heads
+        hidden_dim = dim_head * heads # Total dimension for Q, K, V
 
-    @nn.compact
-    def __call__(self, x):
-        B, D, H, W, C = x.shape
-        dim = self.dim_head * self.heads
-        qkv = nn.Conv(
-            features=dim * 3, kernel_size=(1, 1, 1), use_bias=False, dtype=self.dtype, name='to_qkv.conv_0'
-        )(x)
-        q, k, v = jnp.split(qkv, 3, axis=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b d H_spatial w (h d_head) -> b (d H_spatial w) h d_head', h=self.heads, d_head=self.dim_head), (q, k, v))
-        assert q.shape == k.shape == v.shape == (B, D * H * W, self.heads, self.dim_head)
-        q = q / jnp.clip(jnp.linalg.norm(q, ord=2, axis=-1, keepdims=True), a_min=1e-12)
-        k = k / jnp.clip(jnp.linalg.norm(k, ord=2, axis=-1, keepdims=True), a_min=1e-12)
-        sim = jnp.einsum('b i h d, b j h d -> b h i j', q, k) * self.scale
-        attn = nn.softmax(sim, axis=-1)
-        out = jnp.einsum('b h i j, b j h d -> b h i d', attn, v)
-        out = rearrange(out, 'b num_heads (s_d s_h s_w) head_d -> b s_d s_h s_w (num_heads head_d)', s_d=D, s_h=H, s_w=W)
-        out = nn.Conv(features=C, kernel_size=(1, 1, 1), dtype=self.dtype, name='to_out.conv_0')(out)
-        return out
+        if in_channels % groups_for_norm != 0:
+            valid_groups = [g for g in range(1, groups_for_norm + 1) if in_channels % g == 0]
+            actual_groups = valid_groups[-1] if valid_groups else 1
+            if actual_groups != groups_for_norm:
+                 print(f"Warning: Attention3D groups_for_norm changed from {groups_for_norm} to {actual_groups} for in_channels {in_channels}")
+            groups_for_norm = actual_groups
+        
+        self.norm = nn.GroupNorm(groups_for_norm, in_channels)
+        self.to_qkv = nn.Conv3d(in_channels, hidden_dim * 3, kernel_size=1, bias=False) # Project to Q, K, V
+        self.to_out = nn.Conv3d(hidden_dim, in_channels, kernel_size=1) # Project back to original channels
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor. Shape: (B, C, D, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor after attention. Shape: (B, C, D, H, W).
+        """
+        B, C, D, H, W = x.shape
+        
+        residual = x # Store for residual connection
+        x_norm = self.norm(x)
+        
+        # qkv shape: (B, hidden_dim * 3, D, H, W)
+        qkv = self.to_qkv(x_norm).chunk(3, dim=1) # Split into Q, K, V (each B, hidden_dim, D, H, W)
+        
+        # Rearrange for multi-head attention: (B, heads, D*H*W, dim_head)
+        q, k, v = map(
+            lambda t: rearrange(t, 'b (heads c_h) d h w -> b heads (d h w) c_h', heads=self.heads), 
+            qkv
+        )
+        
+        # Scaled dot-product attention: (Q K^T) / sqrt(d_k)
+        # q: (B, heads, N, dim_head), k: (B, heads, N, dim_head) -> k.transpose: (B, heads, dim_head, N)
+        # dots: (B, heads, N, N) where N = D*H*W
+        dots = torch.einsum('b h i d, b h j d -> b h i j', q, k.transpose(-2, -1)) * self.scale
+        attn_weights = dots.softmax(dim=-1) # Apply softmax over the last dimension (keys)
+        
+        # Apply attention weights to values: (B, heads, N, dim_head)
+        out = torch.einsum('b h i j, b h j d -> b h i d', attn_weights, v)
+        
+        # Rearrange back to original spatial format: (B, hidden_dim, D, H, W)
+        out = rearrange(out, 'b heads (d h w) c_h -> b (heads c_h) d h w', heads=self.heads, d=D, h=H, w=W)
+        out = self.to_out(out) # Project back
+        
+        return out + residual # Add residual connection
+
 
 class LinearAttention3D(nn.Module):
-    """Linear 3D multi-head attention mechanism.
+    """
+    Linear 3D multi-head attention mechanism (memory-efficient alternative).
 
-    Implements a memory-efficient attention mechanism by applying softmax to
-    queries and keys separately, reducing memory usage for large 3D inputs.
-
-    Attributes:
-        heads (int): Number of attention heads (default: 4).
-        dim_head (int): Dimensionality of each head (default: 32).
-        dtype (Any): Data type for computations (default: jnp.float32).
+    Applies softmax to queries and keys separately before their dot product,
+    reducing memory complexity from O(N^2) to O(N).
 
     Args:
-        x (jnp.ndarray): Input tensor, shape (batch_size, depth, height, width, channels).
-
-    Returns:
-        jnp.ndarray: Output tensor, shape (batch_size, depth, height, width, channels).
+        in_channels (int): Number of input channels.
+        heads (int): Number of attention heads. Default is 4.
+        dim_head (int): Dimensionality of each attention head. Default is 32.
+        groups_for_norm (int): Number of groups for GroupNorm layers. Default is 32.
     """
-    heads: int = 4
-    dim_head: int = 32
-    dtype: Any = jnp.float32
+    def __init__(self, in_channels: int, heads: int = 4, dim_head: int = 32, groups_for_norm: int = 32):
+        super().__init__()
+        self.heads = heads
+        hidden_dim = dim_head * heads
 
-    @nn.compact
-    def __call__(self, x):
-        B, D, H, W, C = x.shape
-        dim = self.dim_head * self.heads
-        qkv = nn.Conv(
-            features=dim * 3, kernel_size=(1, 1, 1), use_bias=False, dtype=self.dtype, name='to_qkv.conv_0'
-        )(x)
-        q, k, v = jnp.split(qkv, 3, axis=-1)
-        q, k, v = map(lambda t: rearrange(t, 'b d H_spatial w (h d_head) -> b (d H_spatial w) h d_head', h=self.heads, d_head=self.dim_head), (q, k, v))
-        assert q.shape == k.shape == v.shape == (B, D * H * W, self.heads, self.dim_head)
-        q = nn.softmax(q, axis=-1)
-        k = nn.softmax(k, axis=-3)
-        q = q / jnp.sqrt(self.dim_head)
-        v = v / (D * H * W)
-        context = jnp.einsum('b n h d, b n h e -> b h d e', k, v)
-        out = jnp.einsum('b h d e, b n h d -> b h e n', context, q)
-        out = rearrange(out, 'b num_h dim_h (spatial_d spatial_h spatial_w) -> b spatial_d spatial_h spatial_w (num_h dim_h)', spatial_d=D, spatial_h=H, spatial_w=W)
-        out = nn.Conv(features=C, kernel_size=(1, 1, 1), dtype=self.dtype, name='to_out.conv_0')(out)
-        out = nn.LayerNorm(epsilon=1e-5, use_bias=False, dtype=self.dtype, name='to_out.norm_0')(out)
-        return out
+        if in_channels % groups_for_norm != 0:
+            valid_groups = [g for g in range(1, groups_for_norm + 1) if in_channels % g == 0]
+            actual_groups = valid_groups[-1] if valid_groups else 1
+            if actual_groups != groups_for_norm:
+                 print(f"Warning: LinearAttention3D groups_for_norm changed from {groups_for_norm} to {actual_groups} for in_channels {in_channels}")
+            groups_for_norm = actual_groups
+
+        self.norm = nn.GroupNorm(groups_for_norm, in_channels)
+        self.to_qkv = nn.Conv3d(in_channels, hidden_dim * 3, kernel_size=1, bias=False)
+        
+        self.to_out = nn.Sequential(
+            nn.Conv3d(hidden_dim, in_channels, kernel_size=1),
+            nn.GroupNorm(groups_for_norm, in_channels) # Normalize output
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor. Shape: (B, C, D, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor after linear attention. Shape: (B, C, D, H, W).
+        """
+        B, C, D_spatial, H_spatial, W_spatial = x.shape # Use different names for spatial dims to avoid conflict
+        residual = x
+        x_norm = self.norm(x)
+
+        qkv = self.to_qkv(x_norm).chunk(3, dim=1)
+        # Rearrange q, k, v to (B, heads, dim_head, N) where N = D*H*W
+        q, k, v = map(
+            lambda t: rearrange(t, 'b (h d_h) d h w -> b h d_h (d h w)', h=self.heads), 
+            qkv
+        )
+
+        # Apply softmax to queries (dim=-1, features) and keys (dim=-2, sequence length)
+        # In linear attention, softmax is often applied along different axes.
+        # Original "Attention is All You Need" applies softmax to QK^T.
+        # Linear attention variants (e.g., Linformer, Performer) use kernel methods or other tricks.
+        # A common simplification for "linear attention" is softmax on Q and K independently.
+        q_softmax = q.softmax(dim=-1) # Softmax over features for Q
+        k_softmax = k.softmax(dim=-2) # Softmax over spatial dimension for K
+                                      # (or dim=-1 if thinking of it as features of K)
+
+        # Optional scaling, sometimes seen in linear attention variants
+        # q_softmax = q_softmax / (v.shape[-1] ** 0.25) # Example scaling
+        # k_softmax = k_softmax / (v.shape[-1] ** 0.25)
+
+        # Compute context: K^T V (or similar, depending on the linear attention variant)
+        # k_softmax: (B, heads, dim_head, N) -> k_softmax.transpose: (B, heads, N, dim_head)
+        # v: (B, heads, dim_head, N)
+        # context: (B, heads, dim_head, dim_head) if K^T V
+        # Here, if we do k_softmax @ v.transpose(-1, -2) -> (B, h, d_h, N) @ (B, h, N, d_h) -> (B, h, d_h, d_h)
+        # Or, if we want to sum over N for K:
+        context = torch.einsum('b h d n, b h e n -> b h d e', k_softmax, v) # K V^T (sum over N) -> (B, h, d_h, d_h_v)
+                                                                        # Here d_h_v is dim_head of V
+
+        # Apply Q to context
+        # out: (B, heads, dim_head, N)
+        out = torch.einsum('b h d e, b h d n -> b h e n', context, q_softmax) # Q (K V^T)
+        
+        # Rearrange back: (B, hidden_dim, D, H, W)
+        out = rearrange(out, 'b (h e) d h w -> b (h e) d h w', 
+                        h=self.heads, d=D_spatial, h=H_spatial, w=W_spatial, e=self.to_qkv.out_channels // (3 * self.heads)) # Correct 'e'
+        out = self.to_out(out)
+        
+        return out + residual
 
 class AttnBlock3D(nn.Module):
-    """A 3D attention block with residual connection.
-
-    Applies either standard or linear attention after layer normalization,
-    followed by a residual connection to the input.
-
-    Attributes:
-        heads (int): Number of attention heads (default: 4).
-        dim_head (int): Dimensionality of each head (default: 32).
-        use_linear_attention (bool): If True, uses LinearAttention3D; else, Attention3D
-            (default: True).
-        dtype (Any): Data type for computations (default: jnp.float32).
+    """
+    A 3D attention block that wraps either standard or linear attention.
 
     Args:
-        x (jnp.ndarray): Input tensor, shape (batch_size, depth, height, width, channels).
-
-    Returns:
-        jnp.ndarray: Output tensor, shape (batch_size, depth, height, width, channels).
+        in_channels (int): Number of input channels.
+        heads (int): Number of attention heads. Default is 4.
+        dim_head (int): Dimensionality of each attention head. Default is 32.
+        use_linear_attention (bool): If True, uses LinearAttention3D; otherwise, Attention3D.
+                                     Default is True.
+        groups_for_norm (int): Number of groups for GroupNorm in the attention layers.
     """
-    heads: int = 4
-    dim_head: int = 32
-    use_linear_attention: bool = True
-    dtype: Any = jnp.float32
+    def __init__(self, in_channels: int, heads: int = 4, dim_head: int = 32, 
+                 use_linear_attention: bool = True, groups_for_norm: int = 32):
+        super().__init__()
+        if use_linear_attention:
+            self.attn = LinearAttention3D(in_channels, heads, dim_head, groups_for_norm=groups_for_norm)
+        else:
+            self.attn = Attention3D(in_channels, heads, dim_head, groups_for_norm=groups_for_norm)
 
-    @nn.compact
-    def __call__(self, x):
-        B, D, H, W, C = x.shape
-        normed_x = nn.LayerNorm(epsilon=1e-5, use_bias=False, dtype=self.dtype)(x)
-        attn = LinearAttention3D(self.heads, self.dim_head, dtype=self.dtype) if self.use_linear_attention else Attention3D(self.heads, self.dim_head, dtype=self.dtype)
-        out = attn(normed_x)
-        assert out.shape == (B, D, H, W, C)
-        return out + x
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input tensor. Shape: (B, C, D, H, W).
+
+        Returns:
+            torch.Tensor: Output tensor after attention. Shape: (B, C, D, H, W).
+        """
+        return self.attn(x)
+
 
 class UNet3D(nn.Module):
-    """A 3D UNet for diffusion-based generation of voxel embeddings.
+    """
+    A 3D U-Net architecture for diffusion models.
 
-    Implements a UNet with downsampling and upsampling paths, incorporating
-    time-conditioned residual blocks and attention mechanisms. Used to predict
-    noise or clean data in the diffusion process.
-
-    Attributes:
-        dim (int): Base channel dimension for the UNet.
-        init_dim (Optional[int]): Initial channel dimension. If None, uses dim.
-        out_dim (Optional[int]): Output channel dimension. If None, matches input
-            channels or doubles if learned_variance is True.
-        dim_mults (Tuple[int, ...]): Multipliers for channel dimensions in
-            downsampling/upsampling.
-        resnet_block_groups (int): Number of groups for group normalization in
-            ResnetBlock3D (default: 8).
-        learned_variance (bool): If True, predicts variance alongside mean
-            (default: False).
-        dtype (Any): Data type for computations (default: jnp.float32).
+    This network takes a noisy 3D voxel grid and a timestep embedding as input,
+    and typically predicts either the noise added to the grid or the clean grid itself.
+    It features a downsampling path, a bottleneck, and an upsampling path with
+    skip connections, incorporating ResNet blocks and attention mechanisms.
 
     Args:
-        x (jnp.ndarray): Input voxel embeddings, shape
-            (batch_size, depth, height, width, embedding_dim).
-        time (jnp.ndarray): Timestep indices, shape (batch_size,).
-
-    Returns:
-        jnp.ndarray: Predicted embeddings, shape
-            (batch_size, depth, height, width, out_dim).
+        dim (int): Base channel dimension for the U-Net.
+        dim_mults (Tuple[int, ...]): Multipliers for channel dimensions at each
+                                     resolution level in the downsampling/upsampling paths.
+                                     Example: (1, 2, 4, 8)
+        in_channels (int): Number of input channels of the voxel data (e.g., embedding dimension).
+                           If self-conditioning is used, this should be `embedding_dim * 2`.
+        out_dim (Optional[int]): Number of output channels. If None, defaults to `in_channels`
+                                 (or `in_channels // 2` if self-conditioning doubled input).
+        init_dim (Optional[int]): Channel dimension after the initial convolution.
+                                  If None, defaults to `dim`.
+        resnet_block_groups (int): Number of groups for GroupNormalization in ResnetBlock3D.
+        use_linear_attention (bool): Whether to use LinearAttention3D instead of Attention3D.
+        attn_heads (int): Number of heads for attention mechanisms.
+        attn_dim_head (int): Dimension per head for attention mechanisms.
     """
-    dim: int
-    dim_mults: Tuple[int, ...]
-    init_dim: Optional[int] = None
-    out_dim: Optional[int] = None
-    resnet_block_groups: int = 8
-    learned_variance: bool = False
-    dtype: Any = jnp.float32
+    def __init__(self,
+                 dim: int,
+                 dim_mults: Tuple[int, ...],
+                 in_channels: int,
+                 out_dim: Optional[int] = None,
+                 init_dim: Optional[int] = None,
+                 resnet_block_groups: int = 8,
+                 use_linear_attention: bool = True,
+                 attn_heads: int = 4,
+                 attn_dim_head: int = 32):
+        super().__init__()
 
-    @nn.compact
-    def __call__(self, x, time):
-        B, D, H, W, C = x.shape
-        init_dim = self.dim if self.init_dim is None else self.init_dim
-        hs = []
-        h = nn.Conv(
-            features=init_dim, kernel_size=(7, 7, 7), padding=((3, 3), (3, 3), (3, 3)), name='init.conv_0', dtype=self.dtype
-        )(x)
-        hs.append(h)
-        time_emb = SinusoidalPosEmb(self.dim, dtype=self.dtype)(time)
-        time_emb = nn.Dense(features=self.dim * 4, dtype=self.dtype, name='time_mlp.dense_0')(time_emb)
-        time_emb = nn.Dense(features=self.dim * 4, dtype=self.dtype, name='time_mlp.dense_1')(nn.gelu(time_emb))
-        num_resolutions = len(self.dim_mults)
-        for ind in range(num_resolutions):
-            dim_in = h.shape[-1]
-            h = ResnetBlock3D(dim=dim_in, groups=self.resnet_block_groups, dtype=self.dtype, name=f'down_{ind}.resblock_0')(h, time_emb)
-            hs.append(h)
-            h = ResnetBlock3D(dim=dim_in, groups=self.resnet_block_groups, dtype=self.dtype, name=f'down_{ind}.resblock_1')(h, time_emb)
-            h = AttnBlock3D(dtype=self.dtype, name=f'down_{ind}.attnblock_0')(h)
-            hs.append(h)
-            if ind < num_resolutions - 1:
-                h = Downsample3D(dim=self.dim * self.dim_mults[ind], dtype=self.dtype, name=f'down_{ind}.downsample_0')(h)
-        mid_dim = self.dim * self.dim_mults[-1]
-        h = nn.Conv(
-            features=mid_dim, kernel_size=(3, 3, 3), padding=((1, 1), (1, 1), (1, 1)), dtype=self.dtype, name=f'down_{num_resolutions-1}.conv_0'
-        )(h)
-        h = ResnetBlock3D(dim=mid_dim, groups=self.resnet_block_groups, dtype=self.dtype, name='mid.resblock_0')(h, time_emb)
-        h = AttnBlock3D(use_linear_attention=False, dtype=self.dtype, name='mid.attenblock_0')(h)
-        h = ResnetBlock3D(dim=mid_dim, groups=self.resnet_block_groups, dtype=self.dtype, name='mid.resblock_1')(h, time_emb)
-        for ind in reversed(range(num_resolutions)):
-            dim_in = self.dim * self.dim_mults[ind]
-            dim_out = self.dim * self.dim_mults[ind-1] if ind > 0 else init_dim
-            h = jnp.concatenate([h, hs.pop()], axis=-1)
-            h = ResnetBlock3D(dim=dim_in, groups=self.resnet_block_groups, dtype=self.dtype, name=f'up_{ind}.resblock_0')(h, time_emb)
-            h = jnp.concatenate([h, hs.pop()], axis=-1)
-            h = ResnetBlock3D(dim=dim_in, groups=self.resnet_block_groups, dtype=self.dtype, name=f'up_{ind}.resblock_1')(h, time_emb)
-            h = AttnBlock3D(dtype=self.dtype, name=f'up_{ind}.attnblock_0')(h)
-            if ind > 0:
-                h = Upsample3D(dim=dim_out, dtype=self.dtype, name=f'up_{ind}.upsample_0')(h)
-        h = nn.Conv(
-            features=init_dim, kernel_size=(3, 3, 3), padding=((1, 1), (1, 1), (1, 1)), dtype=self.dtype, name='up_0.conv_0'
-        )(h)
-        h = jnp.concatenate([h, hs.pop()], axis=-1)
-        out = ResnetBlock3D(dim=self.dim, groups=self.resnet_block_groups, dtype=self.dtype, name='final.resblock_0')(h, time_emb)
-        default_out_dim = C * (1 if not self.learned_variance else 2)
-        out_dim = default_out_dim if self.out_dim is None else self.out_dim
-        return nn.Conv(
-            out_dim, kernel_size=(1, 1, 1), dtype=self.dtype, name='final.conv_0'
-        )(out)
+        self.in_channels = in_channels
+        self.init_dim = init_dim if init_dim is not None else dim
+        
+        # Determine output dimension. If self-conditioning doubles input channels,
+        # the typical output is the original embedding dimension.
+        if out_dim is None:
+            # Heuristic: if in_channels seems doubled (e.g. for self-cond), out_dim is half.
+            # This needs to be set carefully by the user based on `PRED_X0` and `SELF_CONDITION` flags.
+            # For now, let's assume out_dim is explicitly passed or defaults to a sensible value.
+            # A common case: if model predicts noise/x0, out_dim = original_embedding_dim
+            self.out_dim = in_channels 
+        else:
+            self.out_dim = out_dim
+
+
+        # Time embedding projection
+        time_mlp_dim = dim * 4 # Standard dimension for projected time embeddings
+        self.time_mlp = nn.Sequential(
+            SinusoidalPosEmb(dim), # Input to SinusoidalPosEmb is `dim`
+            nn.Linear(dim, time_mlp_dim),
+            nn.GELU(),
+            nn.Linear(time_mlp_dim, time_mlp_dim)
+        )
+
+        # Initial convolution: projects input voxel data to `init_dim` channels
+        self.init_conv = nn.Conv3d(self.in_channels, self.init_dim, kernel_size=7, padding=3)
+
+        # Calculate channel dimensions for each resolution level
+        # Example: if dim=64, dim_mults=(1,2,4), then dims = [init_dim, 64, 128, 256]
+        dims = [self.init_dim, *map(lambda m: dim * m, dim_mults)]
+        # Create pairs of (in_channels, out_channels) for each down/up block
+        in_out = list(zip(dims[:-1], dims[1:]))
+        num_resolutions = len(in_out)
+
+        # --- Downsampling Path ---
+        self.downs = nn.ModuleList([])
+        for i, (dim_in, dim_out) in enumerate(in_out):
+            is_last_resolution = (i >= (num_resolutions - 1))
+            self.downs.append(nn.ModuleList([
+                ResnetBlock3D(dim_in, dim_out, time_emb_dim=time_mlp_dim, groups=resnet_block_groups),
+                ResnetBlock3D(dim_out, dim_out, time_emb_dim=time_mlp_dim, groups=resnet_block_groups),
+                AttnBlock3D(dim_out, heads=attn_heads, dim_head=attn_dim_head, 
+                            use_linear_attention=use_linear_attention, groups_for_norm=resnet_block_groups),
+                Downsample3D(dim_out, dim_out) if not is_last_resolution else nn.Identity()
+            ]))
+
+        # --- Bottleneck ---
+        mid_dim = dims[-1] # Dimension at the bottleneck
+        self.mid_block1 = ResnetBlock3D(mid_dim, mid_dim, time_emb_dim=time_mlp_dim, groups=resnet_block_groups)
+        self.mid_attn = AttnBlock3D(mid_dim, heads=attn_heads, dim_head=attn_dim_head, 
+                                    use_linear_attention=use_linear_attention, groups_for_norm=resnet_block_groups)
+        self.mid_block2 = ResnetBlock3D(mid_dim, mid_dim, time_emb_dim=time_mlp_dim, groups=resnet_block_groups)
+
+        # --- Upsampling Path ---
+        self.ups = nn.ModuleList([])
+        # Iterate in reverse, excluding the initial `init_dim` to `dims[1]` transition
+        for i, (dim_in, dim_out) in enumerate(reversed(in_out[1:])): 
+            is_last_resolution = (i >= (num_resolutions - 2)) # Adjusted for reversed iteration and skipping one
+            self.ups.append(nn.ModuleList([
+                # Input to ResNet block is dim_out (from previous upsample) + dim_in (from skip connection)
+                ResnetBlock3D(dim_out + dim_in, dim_in, time_emb_dim=time_mlp_dim, groups=resnet_block_groups),
+                ResnetBlock3D(dim_in, dim_in, time_emb_dim=time_mlp_dim, groups=resnet_block_groups),
+                AttnBlock3D(dim_in, heads=attn_heads, dim_head=attn_dim_head, 
+                            use_linear_attention=use_linear_attention, groups_for_norm=resnet_block_groups),
+                Upsample3D(dim_in, dim_in) if not is_last_resolution else nn.Identity()
+            ]))
+        
+        # Final convolution: projects features to the desired output dimension
+        # The input to this block will be `dim` (from the last upsampling stage)
+        # concatenated with the skip connection from the `init_conv` stage (which has `init_dim` channels).
+        # If init_dim == dim, then input is dim * 2.
+        final_conv_in_channels = dim + self.init_dim # Corrected based on skip connection from init_conv
+        if self.init_dim != dim: # A common setup is init_dim = dim
+             print(f"UNet3D Warning: init_dim ({self.init_dim}) != dim ({dim}). Final conv input channels: {final_conv_in_channels}")
+
+        self.final_conv = nn.Sequential(
+            ResnetBlock3D(final_conv_in_channels, dim, time_emb_dim=time_mlp_dim, groups=resnet_block_groups),
+            nn.Conv3d(dim, self.out_dim, kernel_size=1) # Final projection to out_dim
+        )
+
+    def forward(self, x: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): Input noisy voxel tensor.
+                              Shape: (B, C_in, D, H, W). C_in is `self.in_channels`.
+            time (torch.Tensor): Timestep indices. Shape: (B,).
+
+        Returns:
+            torch.Tensor: Output tensor (predicted noise or x0).
+                          Shape: (B, C_out, D, H, W). C_out is `self.out_dim`.
+        """
+        # 1. Time embedding
+        t_emb = self.time_mlp(time) # (B, time_mlp_dim)
+        
+        # 2. Initial convolution
+        x = self.init_conv(x) # (B, self.init_dim, D, H, W)
+        
+        # Store for skip connection to the final layer
+        h_init = x.clone() 
+        
+        skip_connections = [] # For skip connections from downsampling path
+
+        # 3. Downsampling Path
+        for resnet_block1, resnet_block2, attn, downsample in self.downs:
+            x = resnet_block1(x, t_emb)
+            x = resnet_block2(x, t_emb)
+            x = attn(x)
+            skip_connections.append(x) # Store for upsampling path
+            x = downsample(x)
+            
+        # 4. Bottleneck
+        x = self.mid_block1(x, t_emb)
+        x = self.mid_attn(x)
+        x = self.mid_block2(x, t_emb)
+
+        # 5. Upsampling Path
+        for resnet_block1, resnet_block2, attn, upsample in self.ups:
+            skip = skip_connections.pop()
+            x = torch.cat((x, skip), dim=1) # Concatenate skip connection
+            
+            x = resnet_block1(x, t_emb)
+            x = resnet_block2(x, t_emb)
+            x = attn(x)
+            x = upsample(x)
+            
+        # 6. Final Layer
+        # Concatenate with the skip connection from the initial convolution output
+        x = torch.cat((x, h_init), dim=1) # CRITICAL FIX: Added this skip connection
+        
+        x = self.final_conv(x) # (B, self.out_dim, D, H, W)
+        return x
