@@ -47,7 +47,7 @@ def get_ddpm_params(config: Dict[str, Any]) -> Dict[str, Any]:
     sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
     sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
     sqrt_one_minus_alphas_cumprod = torch.sqrt(1. - alphas_cumprod)
-    posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod + 1e-8) # Added epsilon
+    posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod + 1e-8) 
 
     p2_loss_weight_gamma = config.get('p2_loss_weight_gamma', 0.0)
     p2_loss_weight_k = config.get('p2_loss_weight_k', 1.0)
@@ -147,32 +147,48 @@ def p_loss(
     noise = torch.randn_like(x_start, device=device)
     x_noisy = q_sample(x_start=x_start, t=t, noise=noise, ddpm_params=ddpm_params)
 
-    x0_self_cond = None
+    # --- Self-Conditioning Preliminary Prediction ---
+    # This part always happens if self_condition is True, to get a candidate x0_self_cond
+    # The model must always receive its expected input channels.
+    prelim_x0_candidate = None
     if self_condition:
         with torch.no_grad():
-            # Model input for self-condition prediction is just x_noisy and t
-            # The UNet's in_channels for this call should be the base (e.g., EMBEDDING_DIM)
-            # If the main model call expects doubled channels for self-cond, this is fine.
-            model_output_sc = model(x_noisy, t) 
-            if pred_x0:
-                x0_self_cond = model_output_sc.detach()
-            else:
-                x0_self_cond = noise_to_x0(model_output_sc, x_noisy, t, ddpm_params).detach()
+            # Input for preliminary prediction: x_noisy + dummy_zeros for the self-cond channel
+            dummy_x0_for_prelim_pred = torch.zeros_like(x_noisy, device=device)
+            prelim_model_input = torch.cat([x_noisy, dummy_x0_for_prelim_pred], dim=1)
+            
+            model_output_sc = model(prelim_model_input, t) 
+            
+            if pred_x0: # If model directly predicts x0
+                 prelim_x0_candidate = model_output_sc.detach() 
+            else: # If model predicts noise
+                 prelim_x0_candidate = noise_to_x0(model_output_sc, x_noisy, t, ddpm_params).detach()
 
-    x_model_input = x_noisy
-    if self_condition and x0_self_cond is not None:
-        # For the main prediction, concatenate if self-conditioning is active
-        # The UNet's in_channels for this call should be doubled (e.g., EMBEDDING_DIM * 2)
-        x_model_input = torch.cat([x_noisy, x0_self_cond], dim=1)
+    # --- Prepare Input for Main Prediction (with probabilistic self-conditioning) ---
+    x_model_input = x_noisy 
+    if self_condition:
+        # Probabilistic choice: 50% use the prelim_x0_candidate, 50% use zeros for self-cond channel
+        if torch.rand(1).item() < 0.5 and prelim_x0_candidate is not None:
+            # Use the computed prelim_x0_candidate
+            x_model_input = torch.cat([x_noisy, prelim_x0_candidate], dim=1)
+            # logging.debug("p_loss: Using PREDICTED x0_self_cond for main prediction.")
+        else:
+            # Use zeros for the self-conditioning channel
+            dummy_x0_for_main_pred = torch.zeros_like(x_noisy, device=device)
+            x_model_input = torch.cat([x_noisy, dummy_x0_for_main_pred], dim=1)
+            # logging.debug("p_loss: Using ZEROS for x0_self_cond for main prediction.")
+    # If not self_condition, x_model_input remains x_noisy (base channels).
+    # This assumes train.py sets the model's in_channels correctly based on the global SELF_CONDITION.
     
     model_output = model(x_model_input, t)
 
+    # --- Calculate Loss ---
     if pred_x0:
         target = x_start
-        loss_val = model_output
+        loss_val = model_output # model_output is predicted x0
     else:
         target = noise
-        loss_val = model_output
+        loss_val = model_output # model_output is predicted noise
 
     if loss_type == 'l2':
         loss = F.mse_loss(loss_val, target, reduction='none')
@@ -181,13 +197,13 @@ def p_loss(
     else:
         raise ValueError(f"Unsupported loss_type: {loss_type}")
 
-    loss = loss.view(loss.shape[0], -1).mean(dim=1)
+    loss = loss.view(loss.shape[0], -1).mean(dim=1) # Loss per sample
 
     if p2_loss_weight_gamma > 0:
         p2_lw = ddpm_params['p2_loss_weight'].gather(0, t.long()).squeeze()
         loss = loss * p2_lw
     
-    return loss.mean()
+    return loss.mean() # Average loss over the batch
 
 def model_predict(
     model: torch.nn.Module, x: torch.Tensor, t: torch.Tensor, ddpm_params: Dict[str, Any],
@@ -195,31 +211,33 @@ def model_predict(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Makes a prediction with the model (either noise or x0) and returns both.
-    Handles self-conditioning based on the `self_condition` flag and `x0_self_cond` input.
+    Handles self-conditioning input preparation.
     """
-    x_model_input = x
-    if self_condition and x0_self_cond is not None:
-        # If self_condition is True AND x0_self_cond is provided, concatenate.
-        # The model's in_channels should be configured to handle this.
-        x_model_input = torch.cat([x, x0_self_cond], dim=1)
-    # If self_condition is False, or x0_self_cond is None, model gets original `x`.
-    # This implies the model's in_channels might vary or needs to be base channels if not self-conditioning.
-    # This logic is typically handled by how `in_channels` is set for the model definition.
+    x_model_input = x 
+    if self_condition: # Model expects doubled channels if self_condition is active
+        if x0_self_cond is not None:
+            x_model_input = torch.cat([x, x0_self_cond], dim=1)
+        else:
+            # First pass of self-conditioning, x0_self_cond is unknown, use zeros
+            dummy_x0 = torch.zeros_like(x, device=x.device)
+            x_model_input = torch.cat([x, dummy_x0], dim=1)
+    # If not self_condition, x_model_input is just x (base channels).
+    # This relies on the U-Net's in_channels being set correctly in train.py.
 
     model_output = model(x_model_input, t)
 
     if pred_x0:
         pred_x0_tensor = model_output
-        pred_noise_tensor = x0_to_noise(pred_x0_tensor, x, t, ddpm_params)
-    else:
+        pred_noise_tensor = x0_to_noise(pred_x0_tensor, x, t, ddpm_params) # x is the original noisy input
+    else: 
         pred_noise_tensor = model_output
-        pred_x0_tensor = noise_to_x0(pred_noise_tensor, x, t, ddpm_params)
+        pred_x0_tensor = noise_to_x0(pred_noise_tensor, x, t, ddpm_params) # x is the original noisy input
     
     return pred_x0_tensor, pred_noise_tensor
 
 def ddpm_sample_step(
     model: torch.nn.Module, x: torch.Tensor, t: torch.Tensor, ddpm_params: Dict[str, Any],
-    self_condition: bool = False, # This flag is now used by model_predict
+    self_condition: bool = False, 
     x0_last: Optional[torch.Tensor] = None, 
     pred_x0: bool = False,
     clip_denoised_value: Optional[float] = None
@@ -227,11 +245,10 @@ def ddpm_sample_step(
     """Performs one step of the DDPM reverse sampling process."""
     device = x.device
     with torch.no_grad():
-        # model_predict will use its 'self_condition' arg and 'x0_self_cond' (passed as x0_last)
         pred_x0_tensor, _ = model_predict(
             model, x, t, ddpm_params,
-            self_condition=self_condition, # Pass the self_condition flag
-            x0_self_cond=x0_last,          # Pass the actual x0 from previous step
+            self_condition=self_condition, 
+            x0_self_cond=x0_last, 
             pred_x0=pred_x0
         )
 
@@ -253,7 +270,7 @@ def ddpm_sample_step(
 def ddpm_inpaint_sample_step(
     model: torch.nn.Module, x: torch.Tensor, t: torch.Tensor, ddpm_params: Dict[str, Any],
     x_true_masked: torch.Tensor, mask: torch.Tensor,
-    self_condition: bool = False, # This flag is now used by model_predict
+    self_condition: bool = False, 
     x0_last: Optional[torch.Tensor] = None, 
     pred_x0: bool = False,
     clip_denoised_value: Optional[float] = None
@@ -263,8 +280,8 @@ def ddpm_inpaint_sample_step(
     with torch.no_grad():
         pred_x0_tensor, _ = model_predict(
             model, x, t, ddpm_params,
-            self_condition=self_condition, # Pass the self_condition flag
-            x0_self_cond=x0_last,          # Pass the actual x0 from previous step
+            self_condition=self_condition, 
+            x0_self_cond=x0_last,
             pred_x0=pred_x0
         )
 
@@ -285,7 +302,7 @@ def ddpm_inpaint_sample_step(
         x_prev_known_region = q_sample(
             x_start=x_true_masked, t=t_minus_1, noise=noise_for_known_diffusion, ddpm_params=ddpm_params
         )
-        pred_x_prev = x_prev_known_region * mask + x_prev_unknown_region * (~mask)
+        pred_x_prev = x_prev_known_region * mask + x_prev_unknown_region * ~mask
     else: 
         pred_x_prev = x_true_masked * mask + pred_x0_tensor * ~mask
         
@@ -295,10 +312,10 @@ def ddpm_inpaint_sample_step(
 @torch.no_grad()
 def sample_loop(
     shape: Tuple[int, ...], timesteps: int, device: torch.device,
-    sampler_fn: Callable[..., Tuple[torch.Tensor, torch.Tensor]], # self_condition is now part of sampler_fn's partial
+    sampler_fn: Callable[..., Tuple[torch.Tensor, torch.Tensor]], 
     initial_voxel: Optional[torch.Tensor] = None,
     progress_desc: str = "sampling loop", 
-    **sampler_fn_kwargs # e.g., clip_denoised_value, or for inpainting: x_true_masked, mask
+    **sampler_fn_kwargs 
 ) -> torch.Tensor:
     """
     Generic sampling loop for diffusion models.
@@ -308,26 +325,20 @@ def sample_loop(
     batch_size = shape[0]
     voxel = torch.randn(shape, device=device) if initial_voxel is None else initial_voxel.to(device)
     
-    # This will store the x0 prediction from the PREVIOUS step.
-    # It's always updated, and sampler_fn (e.g., ddpm_sample_step) will decide to use it
-    # based on its own 'self_condition' argument (which is True/False via functools.partial).
     x0_pred_for_next_step = None 
 
     for i in tqdm(reversed(range(timesteps)), desc=progress_desc, total=timesteps, dynamic_ncols=True):
         t_tensor = torch.full((batch_size,), i, device=device, dtype=torch.long)
         
-        # Pass x0_pred_for_next_step as 'x0_last' to the sampler function.
-        # The sampler_fn (e.g., ddpm_sample_step) will use this if its 'self_condition' arg is True.
-        current_x0_last = x0_pred_for_next_step
+        current_x0_last = x0_pred_for_next_step 
         
         voxel, current_x0_pred = sampler_fn(
             x=voxel, 
             t=t_tensor, 
-            x0_last=current_x0_last, # Always pass, sampler_fn decides to use it
+            x0_last=current_x0_last, 
             **sampler_fn_kwargs
         )
         
-        # Always store the predicted x0 from the current step for the *next* step's self-conditioning input.
         x0_pred_for_next_step = current_x0_pred.detach()
             
     return voxel

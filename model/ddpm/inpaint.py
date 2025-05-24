@@ -21,11 +21,11 @@ except ImportError as e:
 
 
 # --- Configuration for Inpainting Script ---
-TARGET_VOXEL_PATH = "input_voxels/target_scene_to_inpaint.npy" # INPUT: Path to a .npy file with original block IDs (shape VOXEL_SHAPE)
+TARGET_VOXEL_PATH = "./visualize.npy" # INPUT: Path to a .npy file with original block IDs (shape VOXEL_SHAPE)
 INPAINTED_OUTPUT_DIR = "output/inpainted_scenes"
 INPAINTED_FILENAME_PREFIX = "inpainted"
 
-CHECKPOINT_TO_LOAD = "output/ddpm_minecraft_accelerate/checkpoints/checkpoint_latest.pth" 
+CHECKPOINT_TO_LOAD = "output/ddpm/2025-05-24_19-36-51/checkpoints/checkpoint_step_6000.pth" 
 
 MASK_METHOD = "center_square_hole" # Options: "center_square_hole", "random_patches", "bottom_half"
 NUM_INPAINT_SAMPLES = 1 # How many inpainting results to generate for the target scene
@@ -36,7 +36,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def create_mask(voxel_shape: Tuple[int, int, int], method: str = "center_square_hole", 
-                hole_ratio: float = 0.8, patch_ratio: float = 0.1, num_patches: int = 5) -> np.ndarray:
+                hole_ratio: float = 0.875, patch_ratio: float = 0.1, num_patches: int = 5) -> np.ndarray:
     """
     Creates a boolean mask for inpainting. 
     Mask is True (or 1) for known regions, False (or 0) for regions to be inpainted.
