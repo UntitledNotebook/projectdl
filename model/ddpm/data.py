@@ -93,7 +93,7 @@ def get_dataset(
     )
     return dataloader
 
-def get_processed_block_embedding_table( # Renamed for clarity from get_block_embeddings_and_stats
+def get_processed_block_embedding_table(
     embedding_path: str, 
     embedding_dim: int,
     standardize_table: bool = True, # If True, the entire table is standardized
@@ -136,9 +136,8 @@ def get_processed_block_embedding_table( # Renamed for clarity from get_block_em
     else:
         return embedding_table # Return the original table if no standardization requested for the table
 
-def map_ids_to_embeddings( # This function seems fine as is
+def map_ids_to_embeddings(
     block_ids_batch: np.ndarray, 
-    # This `all_block_embeddings` should be the table in the space model expects (e.g. standardized)
     all_block_embeddings_for_input: torch.Tensor, 
     target_device: torch.device
 ) -> torch.Tensor:
@@ -165,10 +164,8 @@ def map_ids_to_embeddings( # This function seems fine as is
 
 def map_embeddings_to_ids(
     predicted_embeddings_batch: torch.Tensor, 
-    # This reference table should be in the SAME space as predicted_embeddings_batch
-    # If model outputs standardized embeddings, this should be the standardized full embedding table.
     reference_embedding_table: torch.Tensor, 
-    metric: str = 'cosine'
+    metric: str = 'euclidean'
 ) -> np.ndarray:
     """
     Converts a batch of predicted embeddings back to the closest block IDs.

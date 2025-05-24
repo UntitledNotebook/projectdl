@@ -285,9 +285,9 @@ def ddpm_inpaint_sample_step(
         x_prev_known_region = q_sample(
             x_start=x_true_masked, t=t_minus_1, noise=noise_for_known_diffusion, ddpm_params=ddpm_params
         )
-        pred_x_prev = x_prev_known_region * mask + x_prev_unknown_region * (1. - mask)
+        pred_x_prev = x_prev_known_region * mask + x_prev_unknown_region * (~mask)
     else: 
-        pred_x_prev = x_true_masked * mask + pred_x0_tensor * (1. - mask)
+        pred_x_prev = x_true_masked * mask + pred_x0_tensor * ~mask
         
     return pred_x_prev, pred_x0_tensor
 
