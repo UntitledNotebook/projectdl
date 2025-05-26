@@ -30,6 +30,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         
         half_dim = self.embedding_dim // 2
         indices = torch.arange(half_dim, device=t.device, dtype=torch.float32)
+        # omegas_k = 1 / (max_period^(2k/embedding_dim))
         omegas = torch.exp(indices * (-math.log(self.max_period) / half_dim))
         args = t.unsqueeze(1) * omegas.unsqueeze(0)
         embedding = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
@@ -58,6 +59,7 @@ class FullTimeEmbedding(nn.Module):
 class WSConv3d(nn.Conv3d):
     """
     Weighted Standardized 3D Convolution.
+    Applies weight standardization to the convolution kernel and includes a learnable gain.
     """
     def __init__(self, in_channels, out_channels, kernel_size, stride=1,
                  padding=0, dilation=1, groups=1, bias=True, padding_mode='zeros',
@@ -67,12 +69,12 @@ class WSConv3d(nn.Conv3d):
         self.eps = eps
         self.gain = nn.Parameter(torch.ones(self.out_channels, 1, 1, 1))
 
-
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         weight = self.weight
         mean = weight.mean(dim=[1, 2, 3, 4], keepdim=True)
         std = weight.std(dim=[1, 2, 3, 4], keepdim=True) + self.eps 
         standardized_weight = (weight - mean) / std
+        
         output = F.conv3d(x, standardized_weight, self.bias, self.stride,
                           self.padding, self.dilation, self.groups)
         output = output * self.gain
@@ -82,7 +84,7 @@ class WSConv3d(nn.Conv3d):
 
 class ResidualBlock3D(nn.Module):
     """
-    Residual block with two WSConv3D layers, GroupNorm, SiLU, and time embedding.
+    Residual block with two WSConv3D layers, GroupNorm, SiLU, and time embedding modulation.
     """
     def __init__(self, in_channels: int, out_channels: int, *, 
                  time_emb_dim: int = None, groups: int = 8, dropout: float = 0.0):
@@ -105,7 +107,6 @@ class ResidualBlock3D(nn.Module):
              safe_groups_out = 1 
         else: 
             raise ValueError(f"out_channels cannot be negative, got {out_channels}")
-
 
         self.conv1 = WSConv3d(in_channels, out_channels, kernel_size=3, padding=1)
         self.norm1 = nn.GroupNorm(num_groups=safe_groups_out, num_channels=out_channels) if out_channels > 0 else nn.Identity()
@@ -151,44 +152,57 @@ class ResidualBlock3D(nn.Module):
 
 class AttentionBlock3D(nn.Module):
     """
-    Self-attention block for 3D feature maps.
+    Standard Self-attention block for 3D feature maps.
     """
-    def __init__(self, channels: int, num_heads: int = 8, head_dim: int = None, groups: int = 8):
+    def __init__(self, channels: int, num_heads: int = 8, head_dim_override: int = None, groups: int = 8):
         super().__init__()
         if channels <= 0: 
             self.channels = 0
             self.identity = nn.Identity()
-            logging.debug("AttentionBlock3D initialized with 0 channels, will act as Identity.")
+            logging.debug(f"{self.__class__.__name__} initialized with 0 channels, will act as Identity.")
             return
             
         self.channels = channels
-        self.num_heads = num_heads # Store original requested num_heads
-        if head_dim is None:
-            current_num_heads = num_heads
-            if channels % current_num_heads != 0 :
-                if current_num_heads > channels and channels > 0 : current_num_heads = channels # Cap heads at channels
-                while channels % current_num_heads != 0 and current_num_heads > 1:
-                    current_num_heads -=1
-                if channels % current_num_heads != 0: 
-                    current_num_heads = 1
-                if num_heads != current_num_heads: # Log if changed
-                    logging.warning(f"AttentionBlock3D: channels ({channels}) not divisible by num_heads ({num_heads}). Adjusted num_heads to {current_num_heads}.")
-                self.num_heads = current_num_heads # Update to adjusted
-            head_dim = channels // self.num_heads
+        self.original_num_heads = num_heads 
+
+        if head_dim_override is not None:
+            if channels % head_dim_override != 0:
+                raise ValueError(f"Channels ({channels}) must be divisible by head_dim_override ({head_dim_override})")
+            self.head_dim = head_dim_override
+            self.num_heads = channels // self.head_dim
+        else: 
+            current_best_num_heads = self.original_num_heads
+            if channels > 0 and channels % self.original_num_heads != 0 : # Ensure channels > 0 before modulo
+                current_best_num_heads = 1 
+                for h_test in range(min(self.original_num_heads, channels), 0, -1): 
+                    if channels % h_test == 0:
+                        current_best_num_heads = h_test
+                        break
+                if self.original_num_heads != current_best_num_heads:
+                    logging.warning(
+                        f"{self.__class__.__name__}: Channels ({channels}) not divisible by num_heads ({self.original_num_heads}). "
+                        f"Adjusted num_heads to {current_best_num_heads}."
+                    )
+            elif channels == 0 : # Should be caught by the first if, but for safety
+                 current_best_num_heads = 1 # Avoid division by zero if channels is 0
+            self.num_heads = current_best_num_heads
+            self.head_dim = channels // self.num_heads if self.num_heads > 0 else 0 # Avoid division by zero
         
-        self.head_dim = head_dim
-        self.scale = head_dim ** -0.5
+        if self.channels > 0 : # Only assert if channels > 0
+            assert self.num_heads * self.head_dim == self.channels, \
+                f"Internal head dim calculation error in {self.__class__.__name__}: {self.num_heads}*{self.head_dim} != {self.channels}"
+        self.scale = self.head_dim ** -0.5 if self.head_dim > 0 else 1.0
         
         safe_groups = groups
-        if groups > channels or channels % groups != 0:
-            for g in range(min(groups, channels), 0, -1):
+        if groups > channels or (channels > 0 and channels % groups != 0):
+            for g in range(min(groups, channels if channels > 0 else 1), 0, -1):
                 if channels % g == 0:
                     safe_groups = g
                     break
-            if channels % safe_groups != 0: safe_groups = 1
+            if channels > 0 and channels % safe_groups != 0: safe_groups = 1
+            elif channels == 0 : safe_groups = 1 # Default for 0 channels
             if groups != safe_groups and groups > 1 :
-                logging.debug(f"Attention: Adjusted GroupNorm groups from {groups} to {safe_groups} for channels={channels}")
-
+                logging.debug(f"{self.__class__.__name__}: Adjusted GroupNorm groups from {groups} to {safe_groups} for channels={channels}")
 
         self.norm = nn.GroupNorm(num_groups=safe_groups, num_channels=channels)
         self.to_qkv = nn.Conv3d(channels, self.num_heads * self.head_dim * 3, kernel_size=1, bias=False)
@@ -205,25 +219,87 @@ class AttentionBlock3D(nn.Module):
         qkv = self.to_qkv(x_norm).chunk(3, dim=1)
         q, k, v = qkv[0], qkv[1], qkv[2]
 
-        q = q.view(B, self.num_heads, self.head_dim, X * Y * Z)
-        k = k.view(B, self.num_heads, self.head_dim, X * Y * Z)
-        v = v.view(B, self.num_heads, self.head_dim, X * Y * Z)
+        N = X * Y * Z
+        q = q.view(B, self.num_heads, self.head_dim, N)
+        k = k.view(B, self.num_heads, self.head_dim, N)
+        v = v.view(B, self.num_heads, self.head_dim, N)
 
         attention_scores = torch.einsum('b h d s, b h d t -> b h s t', q, k) * self.scale
         attention_probs = F.softmax(attention_scores, dim=-1)
         out = torch.einsum('b h s t, b h d t -> b h d s', attention_probs, v)
+        
         out = out.reshape(B, self.num_heads * self.head_dim, X, Y, Z)
         out = self.to_out(out)
         return out + res_x
 
+class LinearAttention3D(nn.Module):
+    """
+    Linear Self-attention block for 3D feature maps with normalization.
+    Approximates attention with linear complexity using feature maps for Q and K.
+    Normalization is based on: out_i = (phi(Q_i)^T M_i) / (phi(Q_i)^T Z_i + eps)
+    where M_i = sum_j (phi(K_j) V_j^T) and Z_i = sum_j phi(K_j).
+    """
+    def __init__(self, channels: int, num_heads: int = 8, groups: int = 8, eps: float = 1e-6):
+        super().__init__()
+        assert channels > 0 and channels % num_heads == 0 and channels % groups == 0, \
+            f"Channels ({channels}) must be positive and divisible by num_heads ({num_heads}) and groups ({groups})."
+        self.channels = channels
+        self.num_heads = num_heads
+        self.head_dim = channels // num_heads
+        self.eps = eps
+
+        self.norm = nn.GroupNorm(num_groups=groups, num_channels=channels)
+        self.to_q = nn.Conv3d(channels, self.num_heads * self.head_dim, kernel_size=1, bias=False)
+        self.to_k = nn.Conv3d(channels, self.num_heads * self.head_dim, kernel_size=1, bias=False)
+        self.to_v = nn.Conv3d(channels, self.num_heads * self.head_dim, kernel_size=1, bias=False)
+        
+        self.to_out = nn.Conv3d(self.num_heads * self.head_dim, channels, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, t_emb: torch.Tensor = None) -> torch.Tensor:
+        B, C, X, Y, Z = x.shape
+        N = X * Y * Z 
+        res_x = x
+        x_norm = self.norm(x)
+
+        q = self.to_q(x_norm).view(B, self.num_heads, self.head_dim, N)
+        k = self.to_k(x_norm).view(B, self.num_heads, self.head_dim, N)
+        v = self.to_v(x_norm).view(B, self.num_heads, self.head_dim, N)
+
+        q_mapped = F.elu(q) + 1.0 
+        k_mapped = F.elu(k) + 1.0 
+        
+        # S_v = K' @ V^T
+        context_val = torch.matmul(k_mapped, v.transpose(-1, -2)) # Shape: (B, H, D_h, D_h)
+        
+        # Numerator = Q' @ S_v = Q' @ (K' @ V^T)
+        # Corrected matmul order:
+        numerator = torch.matmul(context_val, q_mapped) # Shape: (B, H, D_h, N)
+                                                         # (B,H,D_h,D_h) @ (B,H,D_h,N) -> (B,H,D_h,N)
+
+        # S_k = sum_j K'_j (sum over N)
+        k_sum_spatial = torch.sum(k_mapped, dim=-1) # Shape: (B, H, D_h)
+        
+        # Denominator_i = Q'_i^T @ S_k
+        denominator_per_token = torch.einsum('bhdn,bhd->bhn', q_mapped, k_sum_spatial) # Shape: (B, H, N)
+        
+        denominator_final = denominator_per_token.unsqueeze(-2) # Shape: (B, H, 1, N)
+
+        out_lin = numerator / (denominator_final + self.eps) # Shape: (B, H, D_h, N)
+        
+        out_lin = out_lin.reshape(B, self.num_heads * self.head_dim, X, Y, Z)
+        out_lin = self.to_out(out_lin)
+
+        return out_lin + res_x
+
 
 class UNetBlock(nn.Module):
     """
-    A UNet building block: sequence of ResidualBlock3D and optionally AttentionBlock3D.
+    A UNet building block, combining residual blocks and an optional attention block.
     """
     def __init__(self, in_channels: int, out_channels: int, *, 
                  time_emb_dim: int, num_internal_residual_blocks: int = 1, 
-                 use_attention: bool = False, attention_heads: int = 8, 
+                 use_attention: bool = False, attention_type: str = "standard", 
+                 attention_heads: int = 8, 
                  dropout: float = 0.0, groups: int = 8):
         super().__init__()
         self.res_blocks = nn.ModuleList()
@@ -235,7 +311,15 @@ class UNetBlock(nn.Module):
             )
             current_res_block_in_channels = out_channels 
         
-        self.attn = AttentionBlock3D(out_channels, num_heads=attention_heads, groups=groups) if use_attention and out_channels > 0 else nn.Identity()
+        if use_attention and out_channels > 0:
+            if attention_type == "standard":
+                self.attn = AttentionBlock3D(out_channels, num_heads=attention_heads, groups=groups)
+            elif attention_type == "linear":
+                self.attn = LinearAttention3D(out_channels, num_heads=attention_heads, groups=groups)
+            else:
+                raise ValueError(f"Unknown attention type: {attention_type}")
+        else:
+            self.attn = nn.Identity()
 
     def forward(self, x: torch.Tensor, t_emb: torch.Tensor) -> torch.Tensor:
         for res_block in self.res_blocks:
@@ -274,6 +358,7 @@ class UNet3D(nn.Module):
                  time_mlp_hidden_dim: int = 512,
                  time_final_emb_dim: int = None,
                  attention_resolutions_indices: tuple = (1,), 
+                 attention_type: str = "standard", 
                  attention_heads: int = 8,
                  dropout: float = 0.0,
                  groups: int = 8,
@@ -290,6 +375,7 @@ class UNet3D(nn.Module):
         self.channel_mults = channel_mults
         self.num_residual_blocks_per_stage = num_residual_blocks_per_stage
         self.attention_resolutions_indices = attention_resolutions_indices
+        self.attention_type = attention_type 
         self.attention_heads = attention_heads
         self.dropout = dropout
         self.groups = groups
@@ -304,7 +390,6 @@ class UNet3D(nn.Module):
         self.init_conv = WSConv3d(self.total_input_channels, model_channels, 
                                   kernel_size=initial_conv_kernel_size, padding=padding_init)
 
-        # --- Encoder ---
         self.down_blocks = nn.ModuleList()
         current_block_input_ch = model_channels 
         ch_list = [current_block_input_ch] 
@@ -321,6 +406,7 @@ class UNet3D(nn.Module):
                         time_emb_dim=time_final_emb_dim,
                         num_internal_residual_blocks=1, 
                         use_attention=use_attn_this_stage if k_block_in_stage == num_residual_blocks_per_stage - 1 and stage_output_channels > 0 else False,
+                        attention_type=self.attention_type, 
                         attention_heads=attention_heads,
                         dropout=dropout,
                         groups=groups
@@ -333,20 +419,20 @@ class UNet3D(nn.Module):
             if i_stage != len(channel_mults) - 1:
                 self.down_blocks.append(Downsample3D(current_block_input_ch))
         
-        # --- Middle ---
         self.middle_block1 = UNetBlock(
             current_block_input_ch, current_block_input_ch, time_emb_dim=time_final_emb_dim,
             num_internal_residual_blocks=1, use_attention=True if current_block_input_ch > 0 else False, 
+            attention_type=self.attention_type, 
             attention_heads=attention_heads,
             dropout=dropout, groups=groups
         )
         self.middle_block2 = UNetBlock( 
             current_block_input_ch, current_block_input_ch, time_emb_dim=time_final_emb_dim,
             num_internal_residual_blocks=1, use_attention=False, 
+            attention_type=self.attention_type,
             dropout=dropout, groups=groups
         )
 
-        # --- Decoder ---
         self.up_blocks = nn.ModuleList()
         for i_stage, mult in reversed(list(enumerate(channel_mults))):
             stage_target_out_channels = model_channels * mult 
@@ -364,6 +450,7 @@ class UNet3D(nn.Module):
                         time_emb_dim=time_final_emb_dim,
                         num_internal_residual_blocks=1,
                         use_attention=use_attn_this_stage if k_block_in_stage == num_residual_blocks_per_stage - 1 and stage_target_out_channels > 0 else False,
+                        attention_type=self.attention_type, 
                         attention_heads=attention_heads,
                         dropout=dropout,
                         groups=groups
@@ -383,26 +470,9 @@ class UNet3D(nn.Module):
 
 
     def forward(self, x_combined: torch.Tensor, time: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass for the UNet3D.
-        Args:
-            x_combined (torch.Tensor): The combined input tensor (e.g., x_t + x_self_cond or just x_t).
-                                       Shape (B, C_total_input, X, Y, Z).
-            time (torch.Tensor): Time step tensor. Shape (B,).
-        Returns:
-            torch.Tensor: Output tensor. Shape (B, C_output, X, Y, Z).
-        """
         if x_combined.shape[1] != self.total_input_channels:
-            # This check should ideally not be hit if main.py calculates total_input_channels correctly
-            # based on diffusion_config.self_condition_diffusion_process
             logging.error(f"Input x_combined has {x_combined.shape[1]} channels, "
                              f"but model was initialized with total_input_channels={self.total_input_channels}.")
-            # Fallback or raise error:
-            # For robustness, if shapes mismatch, try to process x_combined as is, but it might fail later.
-            # Or, if x_combined has fewer channels than expected, it means self-cond was expected but not provided correctly.
-            # If it has more, it's a more severe mismatch.
-            # For now, let it proceed and potentially fail in init_conv if shapes are truly incompatible.
-            # A better approach would be to ensure config and main.py are perfectly aligned.
 
         t_emb = self.time_embedder(time)
         h = self.init_conv(x_combined) 
@@ -433,7 +503,6 @@ class UNet3D(nn.Module):
                 if k_block_in_decoder_stage == 0: 
                     if temp_h_decoder.shape[2:] != skip_h_from_encoder.shape[2:]:
                         temp_h_decoder = F.interpolate(temp_h_decoder, size=skip_h_from_encoder.shape[2:], mode='trilinear', align_corners=False)
-                        logging.debug(f"Decoder: Resized temp_h_decoder from {temp_h_decoder.shape} to {skip_h_from_encoder.shape} for skip concat.")
                     temp_h_decoder = torch.cat([temp_h_decoder, skip_h_from_encoder], dim=1)
                     
                 temp_h_decoder = self.up_blocks[up_block_module_idx](temp_h_decoder, t_emb)
@@ -449,36 +518,31 @@ class UNet3D(nn.Module):
             out = self.final_norm(temp_h_decoder)
         out = self.final_act(out)
         if isinstance(self.final_conv, nn.Identity):
-            # This case means final_layer_in_channels was 0, which is problematic.
-            # The output should always have self.output_channels.
-            # If final_conv is Identity, it implies temp_h_decoder already has self.output_channels
-            # and final_layer_in_channels matched self.output_channels.
-            # However, if final_layer_in_channels was 0, temp_h_decoder has 0 channels.
-            # This should be prevented by ensuring model_channels and channel_mults don't lead to 0.
-            if temp_h_decoder.shape[1] != self.output_channels:
-                 logging.warning(f"Final conv is Identity, but input channels {temp_h_decoder.shape[1]} != output_channels {self.output_channels}")
-            out = temp_h_decoder # This might be an issue if channels don't match self.output_channels
+            if temp_h_decoder.shape[1] != self.output_channels and self.output_channels > 0 : 
+                 logging.warning(f"Final conv is Identity, but input channels {temp_h_decoder.shape[1]} != output_channels {self.output_channels}. This might be an issue if output_channels > 0.")
+            out = temp_h_decoder 
         else:
             out = self.final_conv(out)
         return out
 
 # --- Example Usage (for testing the model structure) ---
 if __name__ == '__main__':
-    logging.getLogger().setLevel(logging.INFO) # Changed from DEBUG for less verbose default
-    logging.info("Testing UNet3D model structure (simplified input)...")
+    logging.getLogger().setLevel(logging.INFO) 
+    logging.info("Testing UNet3D model structure (with selectable attention)...")
 
     batch_size = 2
     bits_xt_channels = 5 
     bits_self_cond_channels = 5 
     use_self_cond_test = True
+    attention_type_test = "linear" # "standard" or "linear"
 
     total_unet_input_channels = bits_xt_channels
-    if use_self_cond_test:
+    if use_self_cond_test: 
         total_unet_input_channels += bits_self_cond_channels
         
     unet_output_channels = bits_xt_channels
 
-    dim_x, dim_y, dim_z = 16, 16, 16
+    dim_x, dim_y, dim_z = 8, 8, 8 
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logging.info(f"Using device: {device}")
@@ -489,21 +553,22 @@ if __name__ == '__main__':
     try:
         unet_model = UNet3D(
             input_channels=total_unet_input_channels, 
-            model_channels=32,      
+            model_channels=16, 
             output_channels=unet_output_channels, 
-            channel_mults=(1, 2, 2), 
+            channel_mults=(1, 2), 
             num_residual_blocks_per_stage=1, 
-            time_embedding_dim=64, 
-            time_mlp_hidden_dim=128,
-            time_final_emb_dim=128,  
-            attention_resolutions_indices=(1,), 
-            attention_heads=4,
+            time_embedding_dim=32, 
+            time_mlp_hidden_dim=64,
+            time_final_emb_dim=64,  
+            attention_resolutions_indices=(0,1), 
+            attention_type=attention_type_test, 
+            attention_heads=2, 
             dropout=0.0, 
-            groups=8, 
+            groups=4, 
             initial_conv_kernel_size=3
         ).to(device)
 
-        logging.info(f"UNet3D model instantiated successfully with total_input_channels={total_unet_input_channels}.")
+        logging.info(f"UNet3D model instantiated successfully with attention_type='{attention_type_test}', total_input_channels={total_unet_input_channels}.")
         num_params = sum(p.numel() for p in unet_model.parameters() if p.requires_grad)
         logging.info(f"Number of trainable parameters: {num_params / 1e6:.2f} M")
 
@@ -515,7 +580,7 @@ if __name__ == '__main__':
         expected_output_shape = (batch_size, unet_output_channels, dim_x, dim_y, dim_z)
         assert output.shape == expected_output_shape, \
             f"Output shape {output.shape} does not match expected shape {expected_output_shape}"
-        logging.info("Test forward pass completed successfully.")
+        logging.info(f"Test forward pass with attention_type='{attention_type_test}' completed successfully.")
 
     except Exception as e:
         logging.error(f"Error during UNet3D test: {e}", exc_info=True)

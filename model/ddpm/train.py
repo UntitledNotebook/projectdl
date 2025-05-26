@@ -13,7 +13,7 @@ from diffusers.training_utils import EMAModel
 from tqdm.auto import tqdm
 
 import config as TrainConfig 
-from data import get_dataloader, floats_to_ids # Assuming floats_to_ids is in data.py
+from data import get_dataloader, floats_to_ids 
 from model import UNet3D 
 from diffusion import BitDiffusion 
 from utils import log_samples_to_wandb 
@@ -52,6 +52,7 @@ def main():
             os.makedirs(TrainConfig.train_config["output_dir"], exist_ok=True)
 
     # --- WandB Initialization ---
+    wandb_run_active = False
     if accelerator.is_main_process and TrainConfig.train_config["log_with_wandb"]:
         try:
             import wandb 
@@ -69,12 +70,19 @@ def main():
                     else:
                         serializable_config[key] = str(value) 
 
-            accelerator.init_trackers(
-                project_name=TrainConfig.train_config["wandb_project_name"],
-                config=serializable_config, 
-                init_kwargs={"wandb": wandb_kwargs}
-            )
-            logger.info("Weights & Biases initialized.")
+            if wandb.run is None: # Initialize only if no active run
+                accelerator.init_trackers(
+                    project_name=TrainConfig.train_config["wandb_project_name"],
+                    config=serializable_config, 
+                    init_kwargs={"wandb": wandb_kwargs}
+                )
+            wandb_run_active = wandb.run is not None # Check if run is active after attempting init
+            if wandb_run_active:
+                logger.info("Weights & Biases initialized and run is active.")
+            else:
+                logger.warning("WandB run initialization failed or no active run. Skipping WandB logging.")
+                TrainConfig.train_config["log_with_wandb"] = False
+
         except ImportError:
             logger.warning("wandb not installed. Skipping WandB logging.")
             TrainConfig.train_config["log_with_wandb"] = False 
@@ -96,24 +104,25 @@ def main():
     # --- Model ---
     logger.info("Initializing UNet3D model...")
     
-    # Calculate total input channels for UNet based on diffusion process's self-conditioning setting
-    unet_total_input_channels = TrainConfig.data_config["bit_representation_length"] # Channels for x_t
+    unet_input_channels_xt = TrainConfig.data_config["bit_representation_length"]
+    unet_total_input_channels = unet_input_channels_xt
     if TrainConfig.diffusion_config["self_condition_diffusion_process"]:
-        unet_total_input_channels += TrainConfig.data_config["bit_representation_length"] # Add channels for x_self_cond
-        logger.info(f"UNet3D will be initialized with {unet_total_input_channels} total input channels (self-conditioning active).")
+        unet_total_input_channels += unet_input_channels_xt 
+        logger.info(f"UNet3D will be initialized with {unet_total_input_channels} total input channels (self-conditioning active: x_t ({unet_input_channels_xt}) + x_self_cond ({unet_input_channels_xt})).")
     else:
         logger.info(f"UNet3D will be initialized with {unet_total_input_channels} total input channels (self-conditioning INACTIVE).")
 
     unet = UNet3D(
-        input_channels=unet_total_input_channels, # Total combined channels
+        input_channels=unet_total_input_channels, 
         model_channels=TrainConfig.model_config["model_channels"],
-        output_channels=TrainConfig.data_config["bit_representation_length"], # Predicts original x0 channels
+        output_channels=TrainConfig.data_config["bit_representation_length"], 
         channel_mults=TrainConfig.model_config["channel_mults"],
         num_residual_blocks_per_stage=TrainConfig.model_config["num_residual_blocks_per_stage"],
         time_embedding_dim=TrainConfig.model_config["time_embedding_dim"],
         time_mlp_hidden_dim=TrainConfig.model_config["time_mlp_hidden_dim"],
         time_final_emb_dim=TrainConfig.model_config["time_final_emb_dim"],
         attention_resolutions_indices=TrainConfig.model_config["attention_resolutions_indices"],
+        attention_type=TrainConfig.model_config["attention_type"],
         attention_heads=TrainConfig.model_config["attention_heads"],
         dropout=TrainConfig.model_config["dropout"],
         groups=TrainConfig.model_config["groups"],
@@ -123,7 +132,7 @@ def main():
     if accelerator.is_main_process:
         num_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
         logger.info(f"UNet3D initialized. Trainable parameters: {num_params / 1e6:.2f} M")
-        if TrainConfig.train_config["log_with_wandb"] and wandb.run: # Check if wandb.run is active
+        if TrainConfig.train_config["log_with_wandb"] and wandb_run_active:
             wandb.summary["total_trainable_params_M"] = num_params / 1e6
 
 
@@ -178,7 +187,7 @@ def main():
     global_step = 0
     
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataloader.dataset)}")
+    logger.info(f"  Num examples = {len(train_dataloader.dataset)}") # This was already correct
     logger.info(f"  Num Epochs = {TrainConfig.train_config['num_train_epochs']}")
     logger.info(f"  Instantaneous batch size per device = {TrainConfig.data_config['batch_size']}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {TrainConfig.data_config['batch_size'] * accelerator.num_processes * TrainConfig.train_config['gradient_accumulation_steps']}")
@@ -189,16 +198,11 @@ def main():
     progress_bar.set_description("Steps")
 
     for epoch in range(TrainConfig.train_config["num_train_epochs"]):
-        # Get the underlying model for training, as it might be wrapped by Accelerator (e.g., DDP)
-        # The diffusion_process.model will point to the accelerated model.
-        # We need to ensure the model being trained is set to train() mode.
-        # accelerator.unwrap_model(diffusion_process.model).train() # This is one way
-        # Or, since unet is prepared:
-        unet.train() # Ensure the prepared unet is in train mode
+        unet.train() 
 
         train_loss_epoch = 0.0
         for step, batch_x_start_bits in enumerate(train_dataloader):
-            with accelerator.accumulate(unet): # Accumulate on the main model
+            with accelerator.accumulate(unet): 
                 t = torch.rand(batch_x_start_bits.shape[0], device=accelerator.device)
                 loss = diffusion_process.p_losses(batch_x_start_bits, t)
                 train_loss_epoch += loss.detach().item()
@@ -219,58 +223,66 @@ def main():
                 global_step += 1
                 
                 if ema_model:
-                    ema_model.step(unet.parameters()) # Update EMA with training model parameters
+                    ema_model.step(unet.parameters()) 
 
-                if TrainConfig.train_config["log_with_wandb"] and accelerator.is_main_process:
+                if TrainConfig.train_config["log_with_wandb"] and accelerator.is_main_process and wandb_run_active:
                     logs = {
                         "train_loss_step": loss.detach().item(),
                         "lr": lr_scheduler.get_last_lr()[0],
                         "epoch": epoch,
                     }
-                    if wandb.run: accelerator.log(logs, step=global_step) # Check if wandb run is active
+                    accelerator.log(logs, step=global_step)
                 
                 if global_step > 0 and global_step % TrainConfig.train_config["log_samples_every_n_steps"] == 0:
                     if accelerator.is_main_process:
                         logger.info(f"Logging samples at global step {global_step}...")
                         
-                        # Model for sampling: use EMA if available, otherwise the trained model
-                        sampling_unet_instance = UNet3D( # Create a fresh instance for sampling
-                            input_channels=unet_total_input_channels,
+                        current_bit_length_at_sample_log = TrainConfig.data_config["bit_representation_length"]
+                        unet_total_input_channels_for_temp_unet = current_bit_length_at_sample_log
+                        if TrainConfig.diffusion_config["self_condition_diffusion_process"]:
+                            unet_total_input_channels_for_temp_unet += current_bit_length_at_sample_log
+
+                        temp_sampling_unet = UNet3D( 
+                            input_channels=unet_total_input_channels_for_temp_unet,
                             model_channels=TrainConfig.model_config["model_channels"],
-                            output_channels=TrainConfig.data_config["bit_representation_length"],
-                            # ... (all other UNet3D params from config) ...
+                            output_channels=current_bit_length_at_sample_log, # Output should be original bit length
                             channel_mults=TrainConfig.model_config["channel_mults"],
                             num_residual_blocks_per_stage=TrainConfig.model_config["num_residual_blocks_per_stage"],
                             time_embedding_dim=TrainConfig.model_config["time_embedding_dim"],
                             time_mlp_hidden_dim=TrainConfig.model_config["time_mlp_hidden_dim"],
                             time_final_emb_dim=TrainConfig.model_config["time_final_emb_dim"],
                             attention_resolutions_indices=TrainConfig.model_config["attention_resolutions_indices"],
+                            attention_type=TrainConfig.model_config["attention_type"],
                             attention_heads=TrainConfig.model_config["attention_heads"],
                             dropout=TrainConfig.model_config["dropout"],
                             groups=TrainConfig.model_config["groups"],
                             initial_conv_kernel_size=TrainConfig.model_config["initial_conv_kernel_size"]
                         ).to(accelerator.device)
+                        
 
                         if ema_model:
-                            logger.info("Applying EMA weights for sample logging...")
-                            ema_model.copy_to(sampling_unet_instance.parameters())
+                            logger.info("Applying EMA weights to temp model for sample logging...")
+                            ema_model.copy_to(temp_sampling_unet.parameters())
                         else:
                             logger.info("Using current training weights for sample logging (EMA not active)...")
-                            sampling_unet_instance.load_state_dict(accelerator.unwrap_model(unet).state_dict())
+                            temp_sampling_unet.load_state_dict(accelerator.unwrap_model(unet).state_dict())
                         
-                        sampling_unet_instance.eval()
+                        temp_sampling_unet.eval()
                         
-                        sampling_diffusion_process = BitDiffusion( 
-                            model=sampling_unet_instance, # Use the correct model instance for sampling
+                        sampling_diffusion_process_for_log = BitDiffusion( 
+                            model=temp_sampling_unet, 
                             analog_bit_scale=TrainConfig.diffusion_config["analog_bit_scale"],
                             self_condition_enabled_in_model=TrainConfig.diffusion_config["self_condition_diffusion_process"],
                             gamma_ns=TrainConfig.diffusion_config["gamma_ns"],
                             gamma_ds=TrainConfig.diffusion_config["gamma_ds"]
                         )
-
-                        samples_analog_bits = sampling_diffusion_process.sample(
+                        
+                        samples_analog_bits = sampling_diffusion_process_for_log.sample(
                             batch_size=TrainConfig.train_config["num_samples_to_log"],
-                            shape=tuple(TrainConfig.data_config["image_spatial_shape"]), 
+                            shape=(
+                                TrainConfig.data_config["bit_representation_length"], 
+                                *TrainConfig.data_config["image_spatial_shape"]
+                            ), 
                             device=accelerator.device,
                             num_steps=TrainConfig.train_config["sampling_steps_train"],
                             time_difference_td=TrainConfig.train_config["time_difference_td"]
@@ -282,9 +294,8 @@ def main():
                             global_step, 
                             accelerator,
                             num_to_log=TrainConfig.train_config["num_samples_to_log"],
-                            floats_to_ids_func=floats_to_ids
                         )
-                        # No need to set sampling_unet_instance back to train() as it's temporary
+                        unet.train() # Ensure main model is back in train mode
 
             logs_postfix = {"step_loss": loss.detach().item()}
             if lr_scheduler.get_last_lr(): 
@@ -295,7 +306,7 @@ def main():
                 break
         
         avg_epoch_loss = train_loss_epoch / len(train_dataloader) if len(train_dataloader) > 0 else 0.0
-        if TrainConfig.train_config["log_with_wandb"] and accelerator.is_main_process and wandb.run:
+        if TrainConfig.train_config["log_with_wandb"] and accelerator.is_main_process and wandb_run_active:
             accelerator.log({"train_loss_epoch": avg_epoch_loss, "epoch": epoch}, step=global_step)
         logger.info(f"Epoch {epoch} finished. Average Loss: {avg_epoch_loss:.4f}")
 
@@ -306,20 +317,37 @@ def main():
     # --- End of Training ---
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unwrapped_model = accelerator.unwrap_model(unet) # Get the original model
+        unwrapped_model = accelerator.unwrap_model(unet) 
         model_save_path = os.path.join(TrainConfig.train_config["output_dir"], "final_unet_model.pt")
         accelerator.save(unwrapped_model.state_dict(), model_save_path)
         logger.info(f"Saved final UNet model state_dict to {model_save_path}")
         
         if ema_model:
             ema_save_path = os.path.join(TrainConfig.train_config["output_dir"], "final_ema_model.pt")
-            # Apply EMA weights to the unwrapped model for saving the EMA version
-            ema_model.copy_to(unwrapped_model.parameters()) 
-            accelerator.save(unwrapped_model.state_dict(), ema_save_path)
+            # For saving EMA, create a temporary model, load EMA weights, then save its state_dict
+            final_ema_unet = UNet3D( # Re-init with same config as training unet
+                input_channels=unet_total_input_channels, # Use the same total input channels as the main unet
+                model_channels=TrainConfig.model_config["model_channels"],
+                output_channels=TrainConfig.data_config["bit_representation_length"],
+                channel_mults=TrainConfig.model_config["channel_mults"],
+                num_residual_blocks_per_stage=TrainConfig.model_config["num_residual_blocks_per_stage"],
+                time_embedding_dim=TrainConfig.model_config["time_embedding_dim"],
+                time_mlp_hidden_dim=TrainConfig.model_config["time_mlp_hidden_dim"],
+                time_final_emb_dim=TrainConfig.model_config["time_final_emb_dim"],
+                attention_resolutions_indices=TrainConfig.model_config["attention_resolutions_indices"],
+                attention_type=TrainConfig.model_config["attention_type"],
+                attention_heads=TrainConfig.model_config["attention_heads"],
+                dropout=TrainConfig.model_config["dropout"],
+                groups=TrainConfig.model_config["groups"],
+                initial_conv_kernel_size=TrainConfig.model_config["initial_conv_kernel_size"]
+            ).to(accelerator.device) # Ensure it's on the right device before loading state
+            ema_model.copy_to(final_ema_unet.parameters()) 
+            accelerator.save(final_ema_unet.state_dict(), ema_save_path)
             logger.info(f"Saved final EMA model state_dict to {ema_save_path}")
 
+
     if TrainConfig.train_config["log_with_wandb"] and accelerator.is_main_process: 
-        if wandb.run: 
+        if wandb_run_active and wandb.run: # Check if wandb.run is active before finishing
             wandb.finish()
     logger.info("Training finished.")
 

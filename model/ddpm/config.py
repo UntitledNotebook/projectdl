@@ -1,11 +1,12 @@
 # config.py
+import time
 
 # -- Data Configuration --
 data_config = {
-    "data_file_path": "/home/f3f3x0/Documents/projectdl/model/ddpm/data.npy", 
+    "data_file_path": "/root/autodl-tmp/projectdl/data/block_ids_20000.npy", 
     "bit_representation_length": 5,  # Channels for x_t, and also for x_self_cond if used
     "image_spatial_shape": (32, 32, 32), 
-    "batch_size": 8,
+    "batch_size": 48,
     "num_workers": 4,
     "shuffle_data": True,
 }
@@ -25,7 +26,8 @@ model_config = {
     "time_embedding_dim": 128,
     "time_mlp_hidden_dim": 512,
     "time_final_emb_dim": 512, 
-    "attention_resolutions_indices": (1,), 
+    "attention_resolutions_indices": (1, 2,),
+    "attention_type": "linear",
     "attention_heads": 8,
     "dropout": 0.1,
     "groups": 8,
@@ -34,7 +36,7 @@ model_config = {
 
 # -- Diffusion Process Configuration --
 diffusion_config = {
-    "analog_bit_scale": 1.0, 
+    "analog_bit_scale": 1.0,
     "self_condition_diffusion_process": True, # Master flag for enabling self-conditioning behavior in BitDiffusion
     "gamma_ns": 0.0002,
     "gamma_ds": 0.00025,
@@ -42,7 +44,7 @@ diffusion_config = {
 
 # -- Training Configuration --
 train_config = {
-    "num_train_epochs": 200,
+    "num_train_epochs": 20,
     "learning_rate": 1e-4,
     "adam_beta1": 0.9,
     "adam_beta2": 0.999,
@@ -52,18 +54,18 @@ train_config = {
     "lr_warmup_steps": 500,
     "gradient_accumulation_steps": 1,
     "mixed_precision": "no",  
-    "output_dir": "outputs/diffusion_minecraft_simplified_v2", 
+    "output_dir": f"outputs/{time.strftime('%Y%m%d-%H%M%S')}", 
     "seed": 42,
     
     "log_with_wandb": True,
-    "wandb_project_name": "minecraft_bit_diffusion_simplified_v2", 
+    "wandb_project_name": "projectdl", 
     "wandb_entity_name": None, 
-    "wandb_group": "ddpm_self_cond_agnostic_unet",
+    "wandb_group": "ddpm",
     
-    "sampling_steps_train": 50, 
+    "sampling_steps_train": 1000, 
     "time_difference_td": 0.0, 
     "num_samples_to_log": 4,   
-    "log_samples_every_n_steps": 10000, 
+    "log_samples_every_n_steps": 5000,
     "ema_decay": 0.9999, 
 }
 

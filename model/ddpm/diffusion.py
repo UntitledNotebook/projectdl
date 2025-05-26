@@ -126,37 +126,15 @@ class BitDiffusion(nn.Module):
         final_predicted_x0 = None 
 
         for i in tqdm(range(num_steps), desc=f"DDIM {'Inpainting' if is_inpainting else 'Sampling'} Progress"):
-            t_now_val = times[i]      
-            t_next_val = times[i+1]   
-            t_now_batch = torch.full((batch_size,), t_now_val, device=device, dtype=torch.float32)
-            t_next_batch_for_ddim_step = torch.full((batch_size,), t_next_val, device=device, dtype=torch.float32) # Renamed for clarity
-
-            # Time for network prediction (asymmetric time interval)
-            # The paper says t_prime = t_now + xi for f(x_t, t_prime)
-            # And t_next for ddim_step is max(1 - (step+1+td)/steps, 0)
-            # Let's stick to the paper's Algorithm 2 for t_next and t_now for model
-            # t_now_for_model = 1.0 - (i / num_steps) # This is t_now from Algorithm 2
-            # t_next_for_ddim = max(1.0 - ((i + 1 + time_difference_td) / num_steps), 0.0) # This is t_next from Algorithm 2
-
-            # Simpler: use t_now_val for model's time, and t_next_val for ddim step's target.
-            # The time_difference_td from paper's Algorithm 2: t_next = max(1 - (step+1+td)/steps, 0)
-            # This means td effectively makes the t_next "earlier" or "later" in the schedule.
-            # If td > 0, t_next is smaller (closer to 0), meaning a larger step.
-            # If td < 0, t_next is larger (further from 0), meaning a smaller step.
-            # The paper uses td for t_next in Algorithm 2.
-            # The t_now passed to model is just the current t_now.
-            # Let's ensure t_prime_for_model logic is consistent with paper's f(x_t, t') where t' = t + xi
-            # The prompt mentioned "asymmetric time intervals, implemented via a simple manipulation of time scheduling at generation"
-            # "we have f(x_t, t') where t' = t + xi" and xi is time_difference_td.
-            
-            t_prime_for_model_val = min(t_now_val + time_difference_td, 1.0) # t' = t_now + td (capped at 1.0)
-            t_prime_for_model_batch = torch.full((batch_size,), t_prime_for_model_val, device=device, dtype=torch.float32)
-
+            t_next_val = max(times[i+1] - time_difference_td / num_steps, 0.0)
+            t_now_batch = torch.full((batch_size,), times[i], device=device, dtype=torch.float32)
+            t_next_batch = torch.full((batch_size,), t_next_val, device=device, dtype=torch.float32)
+ 
             model_input_combined_sampling = current_xt
             if self.self_condition_enabled_in_model:
                 model_input_combined_sampling = torch.cat([current_xt, current_x0_self_cond_for_concat], dim=1)
             
-            predicted_x0_this_step = self.model(model_input_combined_sampling, t_prime_for_model_batch)
+            predicted_x0_this_step = self.model(model_input_combined_sampling, t_now_batch)
 
             if self.self_condition_enabled_in_model:
                 current_x0_self_cond_for_concat = predicted_x0_this_step.detach() 
@@ -164,11 +142,11 @@ class BitDiffusion(nn.Module):
             if i == num_steps - 1: 
                 final_predicted_x0 = predicted_x0_this_step
             
-            x_prev_candidate = self._ddim_step(current_xt, predicted_x0_this_step, t_now_batch, t_next_batch_for_ddim_step)
+            x_prev_candidate = self._ddim_step(current_xt, predicted_x0_this_step, t_now_batch, t_next_batch)
 
             if is_inpainting:
                 if t_next_val > 1e-5: 
-                    x_true_noised_to_t_next = self.q_sample(x_true_bits, t_next_batch_for_ddim_step) # Use same t_next
+                    x_true_noised_to_t_next = self.q_sample(x_true_bits, t_next_batch) # Use same t_next
                     current_xt = (1.0 - mask) * x_prev_candidate + mask * x_true_noised_to_t_next
                 else: 
                     current_xt = (1.0 - mask) * x_prev_candidate + mask * x_true_bits
@@ -177,7 +155,6 @@ class BitDiffusion(nn.Module):
             
         output_analog_bits = final_predicted_x0 if not is_inpainting and final_predicted_x0 is not None else current_xt
         
-        logging.info(f"DDIM {'inpainting' if is_inpainting else 'sampling'} completed.")
         return output_analog_bits
 
 # --- Example Usage (Illustrative) ---
