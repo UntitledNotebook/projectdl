@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 import config as TrainConfig 
 from data import get_dataloader, floats_to_ids 
 from model import UNet3D, get_model
-from diffusion import BitDiffusion 
+from diffusion import get_diffusion
 from utils import log_samples_to_wandb 
 
 logger = get_logger(__name__, log_level="INFO")
@@ -97,15 +97,6 @@ def main():
 
     # --- Model ---
     logger.info("Initializing UNet3D model...")
-    
-    unet_input_channels_xt = TrainConfig.data_config["bit_representation_length"]
-    unet_total_input_channels = unet_input_channels_xt
-    if TrainConfig.diffusion_config["self_condition_diffusion_process"]:
-        unet_total_input_channels += unet_input_channels_xt 
-        logger.info(f"UNet3D will be initialized with {unet_total_input_channels} total input channels (self-conditioning active: x_t ({unet_input_channels_xt}) + x_self_cond ({unet_input_channels_xt})).")
-    else:
-        logger.info(f"UNet3D will be initialized with {unet_total_input_channels} total input channels (self-conditioning INACTIVE).")
-
     unet = get_model(TrainConfig.model_config)
     
     if accelerator.is_main_process:
@@ -117,13 +108,7 @@ def main():
 
     # --- Diffusion Process ---
     logger.info("Initializing BitDiffusion process...")
-    diffusion_process = BitDiffusion(
-        model=unet, 
-        analog_bit_scale=TrainConfig.diffusion_config["analog_bit_scale"],
-        self_condition_enabled_in_model=TrainConfig.diffusion_config["self_condition_diffusion_process"],
-        gamma_ns=TrainConfig.diffusion_config["gamma_ns"],
-        gamma_ds=TrainConfig.diffusion_config["gamma_ds"]
-    )
+    diffusion_process = get_diffusion(unet, TrainConfig.diffusion_config)
 
     # --- EMA Model ---
     if TrainConfig.train_config["ema_decay"] > 0:
@@ -231,15 +216,12 @@ def main():
                             temp_sampling_unet.load_state_dict(accelerator.unwrap_model(unet).state_dict())
                         
                         temp_sampling_unet.eval()
-                        
-                        sampling_diffusion_process_for_log = BitDiffusion( 
-                            model=temp_sampling_unet, 
-                            analog_bit_scale=TrainConfig.diffusion_config["analog_bit_scale"],
-                            self_condition_enabled_in_model=TrainConfig.diffusion_config["self_condition_diffusion_process"],
-                            gamma_ns=TrainConfig.diffusion_config["gamma_ns"],
-                            gamma_ds=TrainConfig.diffusion_config["gamma_ds"]
+
+                        sampling_diffusion_process_for_log = get_diffusion(
+                            model=temp_sampling_unet,
+                            config=TrainConfig.diffusion_config
                         )
-                        
+
                         samples_analog_bits = sampling_diffusion_process_for_log.sample(
                             batch_size=TrainConfig.train_config["num_samples_to_log"],
                             shape=(

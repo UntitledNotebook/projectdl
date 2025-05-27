@@ -156,6 +156,15 @@ class BitDiffusion(nn.Module):
         output_analog_bits = final_predicted_x0 if not is_inpainting and final_predicted_x0 is not None else current_xt
         
         return output_analog_bits
+    
+def get_diffusion(model: nn.Module, config: dict[str, any]) -> BitDiffusion:
+    return BitDiffusion(
+        model=model,
+        analog_bit_scale=config.get("analog_bit_scale", 1.0),
+        self_condition_enabled_in_model=config.get("self_condition_diffusion_process", True),
+        gamma_ns=config.get("gamma_ns", 0.0002),
+        gamma_ds=config.get("gamma_ds", 0.00025)
+    )
 
 # --- Example Usage (Illustrative) ---
 if __name__ == '__main__':

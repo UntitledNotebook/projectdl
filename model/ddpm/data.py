@@ -50,7 +50,6 @@ def ids_to_floats(block_ids: np.ndarray, bit_length: int) -> torch.Tensor:
             where L is the bit_length.
     """
     expanded_ids = block_ids[..., np.newaxis]  # Shape (N, X, Y, Z, 1)
-    print(expanded_ids.shape)
     bit_indices = np.arange(bit_length, dtype=np.uint8)
     all_bits_flat = (expanded_ids >> bit_indices) & 1  # Shape (N, X, Y, Z, L)
     

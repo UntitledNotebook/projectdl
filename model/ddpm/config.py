@@ -64,17 +64,3 @@ train_config = {
     "log_samples_every_n_steps": 5000,
     "ema_decay": 0.9999, 
 }
-
-inpaint_config = {
-    "data_file_path": "/root/autodl-tmp/projectdl/data/single_id.npy",
-    "bit_representation_length": 5,
-    "image_spatial_shape": (32, 32, 32),
-    "sampling_steps": 1000,
-    "time_difference_td": 0.0,
-    "checkpoint_path": "outputs/20250526-204423/final_ema_model.pt",
-    "output_dir": "outputs/inpainted_samples",
-    "analog_bit_scale": 1.0,
-    "self_condition_diffusion_process": True,
-    "gamma_ns": 0.0002,
-    "gamma_ds": 0.00025,
-}
