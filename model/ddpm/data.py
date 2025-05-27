@@ -36,6 +36,29 @@ def floats_to_ids(model_output_tensor: torch.Tensor, bit_length: int) -> np.ndar
     
     return ids.astype(np.int32)
 
+def ids_to_floats(block_ids: np.ndarray, bit_length: int) -> torch.Tensor:
+    """
+    Converts integer block IDs to a float tensor representing bits scaled to ~[-1, 1].
+
+    Args:
+        block_ids (np.ndarray): Array of integer block IDs.
+            Shape (N, X, Y, Z) or (X, Y, Z).
+        bit_length (int): The fixed length of the bit representation.
+
+    Returns:
+        torch.Tensor: Tensor of floats with shape (N, L, X, Y, Z) or (L, X, Y, Z),
+            where L is the bit_length.
+    """
+    expanded_ids = block_ids[..., np.newaxis]  # Shape (N, X, Y, Z, 1)
+    print(expanded_ids.shape)
+    bit_indices = np.arange(bit_length, dtype=np.uint8)
+    all_bits_flat = (expanded_ids >> bit_indices) & 1  # Shape (N, X, Y, Z, L)
+    
+    all_bits_permuted = all_bits_flat.transpose(0, 4, 1, 2, 3).astype(np.float32)  # Shape (N, L, X, Y, Z)
+    scaled_bits = (2.0 * all_bits_permuted - 1.0)  # Scale to [-1, 1]
+    
+    return torch.from_numpy(scaled_bits)
+
 class VoxelDataset(Dataset):
     """
     PyTorch Dataset for voxel data.
@@ -61,13 +84,13 @@ class VoxelDataset(Dataset):
     def __getitem__(self, idx: int) -> torch.Tensor:
         return self.processed_data[idx].detach()
 
-def get_dataloader(
-    npy_file_path: str, 
-    bit_length: int, 
-    batch_size: int, 
-    shuffle: bool = True, 
-    num_workers: int = 0,
-    pin_memory: bool = True
-) -> DataLoader:
-    dataset = VoxelDataset(npy_file_path=npy_file_path, bit_length=bit_length)
-    return DataLoader(dataset, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers, pin_memory=pin_memory)
+def get_dataloader(dataconfig: dict[str, any]) -> DataLoader:
+    dataset = VoxelDataset(npy_file_path=dataconfig["data_file_path"],
+                           bit_length=dataconfig["bit_representation_length"])
+    return DataLoader(
+        dataset,
+        batch_size=dataconfig["batch_size"],
+        shuffle=dataconfig["shuffle_data"],
+        num_workers=dataconfig["num_workers"],
+        pin_memory=True
+    )

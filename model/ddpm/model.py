@@ -525,6 +525,24 @@ class UNet3D(nn.Module):
             out = self.final_conv(out)
         return out
 
+def get_model(modelconfig: dict[str, any]) -> UNet3D:
+    return UNet3D(
+        input_channels=modelconfig["input_channels"],
+        model_channels=modelconfig["model_channels"],
+        output_channels=modelconfig["output_channels"],
+        channel_mults=modelconfig["channel_mults"],
+        num_residual_blocks_per_stage=modelconfig["num_residual_blocks_per_stage"],
+        time_embedding_dim=modelconfig["time_embedding_dim"],
+        time_mlp_hidden_dim=modelconfig["time_mlp_hidden_dim"],
+        time_final_emb_dim=modelconfig.get("time_final_emb_dim", None),
+        attention_resolutions_indices=modelconfig["attention_resolutions_indices"],
+        attention_type=modelconfig["attention_type"],
+        attention_heads=modelconfig["attention_heads"],
+        dropout=modelconfig["dropout"],
+        groups=modelconfig["groups"],
+        initial_conv_kernel_size=modelconfig["initial_conv_kernel_size"]
+    )
+
 # --- Example Usage (for testing the model structure) ---
 if __name__ == '__main__':
     logging.getLogger().setLevel(logging.INFO) 

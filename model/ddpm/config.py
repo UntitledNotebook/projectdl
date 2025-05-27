@@ -11,16 +11,19 @@ data_config = {
     "shuffle_data": True,
 }
 
-# -- Model (UNet3D) Configuration --
-# The UNet3D model itself is now simpler. Its `input_channels` will be set in main.py
-# based on whether self-conditioning is active in the diffusion process.
-# `output_channels` will be data_config["bit_representation_length"].
-model_config = {
-    # input_channels_xt (for x_t) and num_self_condition_channels_unet are effectively superseded
-    # by data_config["bit_representation_length"] and diffusion_config["self_condition_diffusion_process"]
-    # The UNet will receive a single input tensor with combined channels if self-cond is on.
+# -- Diffusion Process Configuration --
+diffusion_config = {
+    "analog_bit_scale": 1.0,
+    "self_condition_diffusion_process": True, # Master flag for enabling self-conditioning behavior in BitDiffusion
+    "gamma_ns": 0.0002,
+    "gamma_ds": 0.00025,
+}
 
-    "model_channels": 64,       
+# -- Model (UNet3D) Configuration --
+model_config = {
+    "input_channels": data_config["bit_representation_length"] * 2 if diffusion_config["self_condition_diffusion_process"] else data_config["bit_representation_length"],
+    "model_channels": 64,
+    "output_channels": data_config["bit_representation_length"],
     "channel_mults": (1, 2, 4), 
     "num_residual_blocks_per_stage": 2,
     "time_embedding_dim": 128,
@@ -34,13 +37,6 @@ model_config = {
     "initial_conv_kernel_size": 3,
 }
 
-# -- Diffusion Process Configuration --
-diffusion_config = {
-    "analog_bit_scale": 1.0,
-    "self_condition_diffusion_process": True, # Master flag for enabling self-conditioning behavior in BitDiffusion
-    "gamma_ns": 0.0002,
-    "gamma_ds": 0.00025,
-}
 
 # -- Training Configuration --
 train_config = {
@@ -69,6 +65,16 @@ train_config = {
     "ema_decay": 0.9999, 
 }
 
-# No specific consistency checks needed here for UNet input channels,
-# as it's now handled dynamically in main.py based on diffusion_config.
-
+inpaint_config = {
+    "data_file_path": "/root/autodl-tmp/projectdl/data/single_id.npy",
+    "bit_representation_length": 5,
+    "image_spatial_shape": (32, 32, 32),
+    "sampling_steps": 1000,
+    "time_difference_td": 0.0,
+    "checkpoint_path": "outputs/20250526-204423/final_ema_model.pt",
+    "output_dir": "outputs/inpainted_samples",
+    "analog_bit_scale": 1.0,
+    "self_condition_diffusion_process": True,
+    "gamma_ns": 0.0002,
+    "gamma_ds": 0.00025,
+}

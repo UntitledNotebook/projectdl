@@ -14,7 +14,7 @@ from tqdm.auto import tqdm
 
 import config as TrainConfig 
 from data import get_dataloader, floats_to_ids 
-from model import UNet3D 
+from model import UNet3D, get_model
 from diffusion import BitDiffusion 
 from utils import log_samples_to_wandb 
 
@@ -93,13 +93,7 @@ def main():
 
     # --- Data ---
     logger.info("Loading dataset...")
-    train_dataloader = get_dataloader(
-        npy_file_path=TrainConfig.data_config["data_file_path"],
-        bit_length=TrainConfig.data_config["bit_representation_length"],
-        batch_size=TrainConfig.data_config["batch_size"],
-        shuffle=TrainConfig.data_config["shuffle_data"],
-        num_workers=TrainConfig.data_config["num_workers"]
-    )
+    train_dataloader = get_dataloader(TrainConfig.data_config)
 
     # --- Model ---
     logger.info("Initializing UNet3D model...")
@@ -112,22 +106,7 @@ def main():
     else:
         logger.info(f"UNet3D will be initialized with {unet_total_input_channels} total input channels (self-conditioning INACTIVE).")
 
-    unet = UNet3D(
-        input_channels=unet_total_input_channels, 
-        model_channels=TrainConfig.model_config["model_channels"],
-        output_channels=TrainConfig.data_config["bit_representation_length"], 
-        channel_mults=TrainConfig.model_config["channel_mults"],
-        num_residual_blocks_per_stage=TrainConfig.model_config["num_residual_blocks_per_stage"],
-        time_embedding_dim=TrainConfig.model_config["time_embedding_dim"],
-        time_mlp_hidden_dim=TrainConfig.model_config["time_mlp_hidden_dim"],
-        time_final_emb_dim=TrainConfig.model_config["time_final_emb_dim"],
-        attention_resolutions_indices=TrainConfig.model_config["attention_resolutions_indices"],
-        attention_type=TrainConfig.model_config["attention_type"],
-        attention_heads=TrainConfig.model_config["attention_heads"],
-        dropout=TrainConfig.model_config["dropout"],
-        groups=TrainConfig.model_config["groups"],
-        initial_conv_kernel_size=TrainConfig.model_config["initial_conv_kernel_size"]
-    )
+    unet = get_model(TrainConfig.model_config)
     
     if accelerator.is_main_process:
         num_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
@@ -242,24 +221,8 @@ def main():
                         if TrainConfig.diffusion_config["self_condition_diffusion_process"]:
                             unet_total_input_channels_for_temp_unet += current_bit_length_at_sample_log
 
-                        temp_sampling_unet = UNet3D( 
-                            input_channels=unet_total_input_channels_for_temp_unet,
-                            model_channels=TrainConfig.model_config["model_channels"],
-                            output_channels=current_bit_length_at_sample_log, # Output should be original bit length
-                            channel_mults=TrainConfig.model_config["channel_mults"],
-                            num_residual_blocks_per_stage=TrainConfig.model_config["num_residual_blocks_per_stage"],
-                            time_embedding_dim=TrainConfig.model_config["time_embedding_dim"],
-                            time_mlp_hidden_dim=TrainConfig.model_config["time_mlp_hidden_dim"],
-                            time_final_emb_dim=TrainConfig.model_config["time_final_emb_dim"],
-                            attention_resolutions_indices=TrainConfig.model_config["attention_resolutions_indices"],
-                            attention_type=TrainConfig.model_config["attention_type"],
-                            attention_heads=TrainConfig.model_config["attention_heads"],
-                            dropout=TrainConfig.model_config["dropout"],
-                            groups=TrainConfig.model_config["groups"],
-                            initial_conv_kernel_size=TrainConfig.model_config["initial_conv_kernel_size"]
-                        ).to(accelerator.device)
+                        temp_sampling_unet = get_model(TrainConfig.model_config).to(accelerator.device)
                         
-
                         if ema_model:
                             logger.info("Applying EMA weights to temp model for sample logging...")
                             ema_model.copy_to(temp_sampling_unet.parameters())
@@ -324,30 +287,13 @@ def main():
         
         if ema_model:
             ema_save_path = os.path.join(TrainConfig.train_config["output_dir"], "final_ema_model.pt")
-            # For saving EMA, create a temporary model, load EMA weights, then save its state_dict
-            final_ema_unet = UNet3D( # Re-init with same config as training unet
-                input_channels=unet_total_input_channels, # Use the same total input channels as the main unet
-                model_channels=TrainConfig.model_config["model_channels"],
-                output_channels=TrainConfig.data_config["bit_representation_length"],
-                channel_mults=TrainConfig.model_config["channel_mults"],
-                num_residual_blocks_per_stage=TrainConfig.model_config["num_residual_blocks_per_stage"],
-                time_embedding_dim=TrainConfig.model_config["time_embedding_dim"],
-                time_mlp_hidden_dim=TrainConfig.model_config["time_mlp_hidden_dim"],
-                time_final_emb_dim=TrainConfig.model_config["time_final_emb_dim"],
-                attention_resolutions_indices=TrainConfig.model_config["attention_resolutions_indices"],
-                attention_type=TrainConfig.model_config["attention_type"],
-                attention_heads=TrainConfig.model_config["attention_heads"],
-                dropout=TrainConfig.model_config["dropout"],
-                groups=TrainConfig.model_config["groups"],
-                initial_conv_kernel_size=TrainConfig.model_config["initial_conv_kernel_size"]
-            ).to(accelerator.device) # Ensure it's on the right device before loading state
+            final_ema_unet = get_model(TrainConfig.model_config).to(accelerator.device)
             ema_model.copy_to(final_ema_unet.parameters()) 
             accelerator.save(final_ema_unet.state_dict(), ema_save_path)
             logger.info(f"Saved final EMA model state_dict to {ema_save_path}")
 
-
     if TrainConfig.train_config["log_with_wandb"] and accelerator.is_main_process: 
-        if wandb_run_active and wandb.run: # Check if wandb.run is active before finishing
+        if wandb_run_active and wandb.run:
             wandb.finish()
     logger.info("Training finished.")
 
