@@ -34,11 +34,15 @@ for cx in range(args.cx, args.cx + cx_len):
         for x_offset in range(16):
             for y_offset in range(y_len):
                 for z_offset in range(16):
-                    block_id = int(true_samples[(cx - args.cx) * 16 + x_offset, y_offset, (cz - args.cz) * 16 + z_offset])
-                    snbt = idx_to_snbt[block_id]
+                    true_block_id = int(true_samples[(cx - args.cx) * 16 + x_offset, y_offset, (cz - args.cz) * 16 + z_offset])
+                    snbt = idx_to_snbt[true_block_id]
                     chunk.set_block(x_offset, y_offset + args.y,
                                     z_offset, Block.from_snbt_blockstate(snbt))
+                    sample_block_id = int(inpaint_samples[(cx - args.cx) * 16 + x_offset, y_offset, (cz - args.cz) * 16 + z_offset])
+                    snbt = idx_to_snbt[sample_block_id]
+                    chunk.set_block(x_offset, y_offset + args.y + 2*y_len,
+                                    z_offset, Block.from_snbt_blockstate(snbt))
+        chunk.changed = True
 logging.info("Finished setting blocks")
-chunk.changed = True
 level.save()
 level.close()
