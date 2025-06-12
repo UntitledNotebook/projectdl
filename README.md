@@ -1,65 +1,80 @@
-# Project DL
+# 3D Diffusion Model for Minecraft Block Generation
 
-## SETUP
+This project presents a voxel-based procedural content generation model for Minecraft, leveraging a conditional Denoising Diffusion Probabilistic Model (DDPM). The model generates 32×32×32 block structures using a 3D U-Net architecture with self-conditioning to ensure temporal consistency and contextual coherence.
 
-- Java version: OpenJDK 21
-- Minecraft version: 1.21.1
-- Minecraft server: PaperMC
+## Key Innovations and Features
 
-Run [`setup.sh`](setup.sh). This script should ensure Java and necessary tools are available.
+*   **Adaptive Block Representation**:
+    *   **Block2vec Embeddings**: Used for encoding smooth terrains (e.g., grasslands). See implementation in [`model/by_block2vec/block2vec/`](model/by_block2vec/block2vec/).
+    *   **Analog Bits Representation**: Handles discrete, high-variance structures (e.g., trees, buildings) at a bit-level. This is integral to the diffusion process in [`model/ddpm/diffusion.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\diffusion.py).
+*   **Conditional Generation**:
+    *   **Biome-Aware**: Supports generation tailored to specific biomes, configurable via files like [`config_Forest.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\config_Forest.py) and [`config_Village.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\config_Village.py).
+    *   **Inpainting**: Enables natural integration of generated chunks into diverse landscapes. See [`model/ddpm/inpaint.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\inpaint.py).
+*   **Advanced Model Architecture & Training**:
+    *   **3D U-Net**: The core architecture for generation, defined in [`model/ddpm/model.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\model.py).
+    *   **Self-Conditioning**: Enhances temporal consistency and contextual coherence, configured in the diffusion process.
+    *   **Cosine-Based Noise Scheduling**: Incorporated for improved denoising performance.
+    *   **Spatiotemporal Attention**: Utilized within the U-Net for enhanced detail and structure.
 
-## Data Collection Workflow
+## Codebase Structure
 
-The data collection process involves two main Python scripts:
+The repository includes the following key components:
 
-1.  **`data.py`**: Automates the generation of Minecraft worlds.
-    *   Downloads the PaperMC server JAR and the Chunky plugin if they are not already present.
-    *   Sets up a new server instance in a timestamped directory (e.g., `server_YYYYMMDD_HHMMSS`).
-    *   Configures `server.properties` with a unique world name (e.g., `world_YYYYMMDD_HHMMSS`) and a random seed.
-    *   Launches the Minecraft server.
-    *   Automatically issues Chunky commands to pre-generate specified regions of the world.
-    *   **Usage**:
+*   **Data Preprocessing**:
+    *   [`chunk_generation.py`](d:\homework\2025Spr\DL\project\projectdl\chunk_generation.py): Script for automating the generation of Minecraft worlds.
+    *   [`chunk_process.py`](d:\homework\2025Spr\DL\project\projectdl\chunk_process.py): Script for processing generated chunks and extracting data for training.
+*   **Representation Learning (Block2vec)**:
+    *   Located under [`model/by_block2vec/block2vec/`](model/by_block2vec/block2vec/).
+    *   [`block2vec.py`](d:\homework\2025Spr\DL\project\projectdl\model\by_block2vec\block2vec\block2vec.py): Defines the CustomBlock2Vec Lightning module.
+    *   [`skipgram.py`](d:\homework\2025Spr\DL\project\projectdl\model\by_block2vec\block2vec\skipgram.py): Implements the SkipGram model.
+    *   [`train.py`](d:\homework\2025Spr\DL\project\projectdl\model\by_block2vec\block2vec\train.py): Training script for Block2vec embeddings.
+*   **DDPM (Denoising Diffusion Probabilistic Model)**:
+    *   Located under [`model/ddpm/`](model/ddpm/).
+    *   [`model.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\model.py): Contains the 3D U-Net definition ([`UNet3D`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\model.py)) and time embeddings ([`SinusoidalTimeEmbedding`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\model.py)).
+    *   [`diffusion.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\diffusion.py): Implements the BitDiffusion process.
+    *   [`train.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\train.py): Main training script for the diffusion model.
+    *   [`data.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\data.py): Data loading and preprocessing for DDPM training.
+    *   Configuration files: [`config.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\config.py), [`config_Forest.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\config_Forest.py), [`config_Village.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\config_Village.py).
+*   **Generation and Utility Scripts**:
+    *   [`model/ddpm/inpaint.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\inpaint.py): Script for performing inpainting using a trained model.
+    *   [`demo/`](demo/): Contains scripts for interacting with Minecraft worlds.
+        *   [`write_to_world.py`](d:\homework\2025Spr\DL\project\projectdl\demo\write_to_world.py): Writes generated structures to a Minecraft world.
+        *   [`read_from_world.py`](d:\homework\2025Spr\DL\project\projectdl\demo\read_from_world.py): Reads data from a Minecraft world.
+    *   [`model/ddpm/utils.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\utils.py): Utility functions, including logging samples.
+
+## Setup and Usage
+
+1.  **Prerequisites**:
+    *   Java (e.g., OpenJDK 21)
+    *   Python and relevant libraries (PyTorch, Accelerate, Diffusers, Amulet-Core, etc.)
+    *   Minecraft server (PaperMC is used in [`chunk_generation.py`](d:\homework\2025Spr\DL\project\projectdl\chunk_generation.py))
+    *   Chunky plugin (downloaded by [`chunk_generation.py`](d:\homework\2025Spr\DL\project\projectdl\chunk_generation.py))
+
+2.  **Data Preparation**:
+    *   Run [`chunk_generation.py`](d:\homework\2025Spr\DL\project\projectdl\chunk_generation.py) to generate raw Minecraft world data.
         ```bash
-        python data.py --memory-per-server 6G --base-port 25565
+        python chunk_generation.py --memory 6G --chunk-radius 16
         ```
-        (Adjust memory and port as needed. Currently, it's simplified to run one server instance).
-        The regions to be generated are defined in the `REGIONS` list within `data.py`.
+    *   Process the generated world data using [`chunk_process.py`](d:\homework\2025Spr\DL\project\projectdl\chunk_process.py) to create training samples.
 
-2.  **`mca2json.py`**: Extracts data from the generated worlds and converts it into JSON format for model training.
-    *   Scans the current directory (or a specified `--base-scan-dir`) for `server_*` folders.
-    *   Identifies world save directories within these server folders.
-    *   Uses the Amulet-Core library to read `.mca` region files from these worlds.
-    *   Extracts 128x128x24 (height configurable) block samples from the surface of the Minecraft world, within a specified chunk radius around (0,0).
-    *   For each block in a sample, it records its namespaced ID, blockstate properties, and relative position.
-    *   Combines all extracted samples from all found worlds into a single JSON output file.
-    *   **Usage**:
+3.  **Representation Learning (Optional but Recommended for Block2vec)**:
+    *   Train Block2vec embeddings:
         ```bash
-        python mca2json.py --radius 16 --y-base 60 --slice-height 24 --output-file training_data.json --base-scan-dir .
+        python model/by_block2vec/block2vec/train.py
         ```
-        *   `--radius`: Specifies the radius in chunks (e.g., 16 means processing chunks from -16 to +15 in X and Z).
-        *   `--y-base`: The starting Y-level for the 24-block high slice.
-        *   `--slice-height`: The height of the Y-slice.
-        *   `--output-file`: Name of the JSON file to save the data.
-        *   `--base-scan-dir`: Directory containing the `server_*` folders.
 
-### Supporting Files
+4.  **Train Diffusion Model**:
+    *   Configure your training settings in one of the `config_*.py` files (e.g., [`model/ddpm/config_Forest.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\config_Forest.py)).
+    *   Run the training script:
+        ```bash
+        accelerate launch model/ddpm/train.py
+        ```
+        (Ensure your `accelerate` config is set up if not using default, or modify `train.py` if it uses a specific config module like `TrainConfig` directly).
 
--   `server.properties`: Template for server configuration.
--   `Chunky_config.yml`: Example configuration for the Chunky plugin (if needed, currently `data.py` uses commands).
--   `spigot.yml`, `bukkit.yml`: Minecraft server configuration files.
+5.  **Generation/Inpainting**:
+    *   Use [`model/ddpm/inpaint.py`](d:\homework\2025Spr\DL\project\projectdl\model\ddpm\inpaint.py) for generating structures or performing inpainting, loading a trained model checkpoint.
+    *   Use scripts in [`demo/`](demo/) to integrate generated data with Minecraft worlds.
 
-## Original Manual Steps (for reference or direct server interaction)
-
-- Tool for exploring `.mca` files: [Amulet Editor](https://www.amuletmc.com/) (GUI based on Amulet-Core).
-- Server download: [PaperMC](https://api.papermc.io/v2/projects/paper/versions/1.21.1/builds/133/downloads/paper-1.21.1-133.jar)
-- Plugin for generation: [Chunky](https://hangarcdn.papermc.io/plugins/pop4959/Chunky/versions/1.4.36/PAPER/Chunky-Bukkit-1.4.36.jar)
-
-If running manually via [`start.sh`](start.sh): Configure your memory properly. After the console appears, you might type commands like `chunky world <worldname>`, `chunky center 0 0`, `chunky radius 256` (for block radius) or `chunky radius 16c` (for chunk radius), and then `chunky start` to start generation.
-
-## TODO
-1.  ~~A python script to launch multiple worlds at the same time for data generation.~~ (Partially done with `data.py` for single instance, can be re-extended if needed).
-2.  ~~A python script to read in the `.mca` file and print out the json formatted training data.~~ (Completed with `mca2json.py`).
-    *   In presentation, remove the particular selected region.
-    *   Put in the regenerated version through json file.
-3.  Develop and train the model using the JSON data.
-4.  Implement a method to convert model output back into a usable Minecraft format (e.g., schematic, or directly modifying world files).
+Refer to individual script arguments (`--help`) and configuration files for more detailed options.
+The [`setup.sh`](setup.sh) script might assist with initial environment setup.
+Server properties can be configured via [`server.properties`](server.properties).
